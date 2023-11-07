@@ -1,14 +1,9 @@
-cff-version: 1.2.0
-message: "If you use this software, please cite it as below."
-authors:
-- family-names: "Naula Duchi"
-  given-names: "Edisson Andrés"
-  orcid: "https://orcid.org/0000-0003-4620-0908"
-- family-names: "José Israel"
-  given-names: "Martínez López"
-  orcid: "https://orcid.org/0000-0000-0000-0000"
-title: "MIQUOD_Multi"
-version: 1.0.0
-doi: 10.5281/zenodo.1234
-date-released: 2023-11-06
-url: "https://github.com/enaulad511/MIQUOD_Multi"
+@article{E.Naula_2017,
+  author = {Edisson Andrés Naula Duchi, José Israel Martínez López},
+  doi = {10.5281/zenodo.1234},
+  month = {12},
+  title = {{My Research Software}},
+  url = {https://github.com/github-linguist/linguist},
+  version = {2.0.4},
+  year = {2023}
+}
