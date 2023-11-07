@@ -12,6 +12,7 @@ version: 1.0.0
 doi: 10.5281/zenodo.1234
 date-released: 2023-11-06
 url: "https://github.com/enaulad511/MIQUOD_Multi"
+
 @article{E.Naula_2017,
   author = {Edisson Andrés Naula Duchi, José Israel Martínez López},
   doi = {10.5281/zenodo.1234},
