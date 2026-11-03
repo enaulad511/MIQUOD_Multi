@@ -1,33 +1,61 @@
 # -*- coding: utf-8 -*-
 """
-`Mixing_QMPD.py`
-====================================================
+Mixing_QMPD
+===========
 
-Functions file adapted of:
-    MIQUOD v1.0
-    Mixing Quantification of Devices Software
-    Author: Hector Betancourt Cervantes, 2017
+Python implementation of the MIQUOD mixing-quantification measures.
 
-* Author(s): 'Edisson Naula'
+Adapted from MIQUOD v1.0 (C#, Hector Betancourt Cervantes, 2017) by Edisson Naula (2020).
 
+Version 2.1 (2026) keeps the function names and the nested-list result layout of the original
+port, and changes the following:
 
+* Coordinates follow the C# / OpenCV convention (column first, see below) and particle
+  positions are absolute image coordinates, as in the C# original.
+* Every pixel and particle loop is vectorised with numpy. The formulas are unchanged, so the
+  results are the same up to floating-point rounding, but a full-size image now takes seconds
+  instead of hours on the concentration path.
+* Runs with several images, several targets per image and calibration no longer crash.
+* Invalid inputs (image not read, target outside the image, no particles detected, ...) raise
+  ``ValueError`` with an explicit message instead of failing deep inside a loop.
+* ``mixing_dim_particle_data`` and ``mixing_dim_concentration_data`` return their results as
+  dictionaries (and still print a summary when ``verbose`` is true).
+* The variogram term is ``(a - b)**2`` as in the C# original (the first port had ``a - b**2``).
+
+Coordinate conventions (identical to C# ``System.Drawing`` and OpenCV)
+----------------------------------------------------------------------
+* ``Rectangle(X, Y, Width, Height)``: ``X`` is the column of the left edge, ``Y`` the row of the
+  top edge, ``Width`` the number of columns and ``Height`` the number of rows. This is exactly
+  the tuple returned by ``cv2.selectROI``.
+* ``Point(X, Y)``: ``X`` is a column, ``Y`` a row. Particle positions are absolute coordinates of
+  the full image, never relative to the target.
+* ``BitMap.Width`` is the number of columns (``img.shape[1]``) and ``BitMap.Height`` the number
+  of rows (``img.shape[0]``).
+* Concentration arrays are indexed ``[x][y]``: the first index runs along the image width. Their
+  shape is therefore ``(Width, Height)``, the transpose of the numpy crop, and the *horizontal*
+  variogram runs along axis 0. This matches the ``[x, y]`` arrays of the C# code.
+
+Result containers are nested lists indexed ``[image_index][target_index]``. Images that have no
+concentration data (for example reference images used only for calibration) hold an empty list.
 """
 __author__ = 'Edisson Naula'
-__date__ = '$ 9/3/2020  at 17:04 $'
+__version__ = '2.1.0'
 
 import math
+import os
+import warnings
+from typing import Dict, List
+
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 
-# region C-like Structures
-from typing import List
+# region C-like structures
 
 
 class Point:
+    """A point with ``X`` = column and ``Y`` = row (``System.Drawing.Point``)."""
+
     def __init__(self, *args):
-        # args -- tuple of anonymous arguments
-        # kwargs -- dictionary of named arguments
         if len(args) == 1:
             self.init_from_hex(args[0])
         elif len(args) == 2:
@@ -41,18 +69,25 @@ class Point:
         self.Y = yin
 
     def init_from_hex(self, dw):
+        """Build the point from a packed 32-bit integer (low word X, high word Y), like C#."""
         tmp = hex(dw).split('x')
-        if 4 < tmp[1].__len__() < 9:
-            lower = tmp[1][tmp[1].__len__() - 4:]
-            upper = tmp[1][0:tmp[1].__len__() - 4]
-        elif tmp[1].__len__() < 4:
+        if 4 < len(tmp[1]) < 9:
+            lower = tmp[1][len(tmp[1]) - 4:]
+            upper = tmp[1][0:len(tmp[1]) - 4]
+        elif len(tmp[1]) < 4:
             lower = tmp[1]
             upper = '0'
         else:
-            lower = tmp[1][tmp[1].__len__() - 4:]
-            upper = tmp[1][0:tmp[1].__len__() - 8]
+            lower = tmp[1][len(tmp[1]) - 4:]
+            upper = tmp[1][0:len(tmp[1]) - 8]
         self.X = int(lower, 16)
         self.Y = int(upper, 16)
+
+    def as_tuple(self):
+        return self.X, self.Y
+
+    def __repr__(self):
+        return 'Point(X=%r, Y=%r)' % (self.X, self.Y)
 
 
 class ListPoints:
@@ -60,24 +95,51 @@ class ListPoints:
         self.point = Point(xin, yin)
 
     def list_points(self, num):
-        arr = []
-        for i in range(num):
-            arr.append(self.point)
-        return arr
+        return [self.point for _ in range(num)]
 
 
 class Rectangle:
+    """Axis-aligned rectangle: ``X``/``Y`` top-left column/row, ``Width`` columns, ``Height`` rows."""
+
     def __init__(self, xin, yin, width, height):
-        self.X = xin
-        self.Y = yin
-        self.Width = width
-        self.Height = height
+        self.X = int(xin)
+        self.Y = int(yin)
+        self.Width = int(width)
+        self.Height = int(height)
+        if self.Width <= 0 or self.Height <= 0:
+            raise ValueError('Rectangle width and height must be positive, got %r' % (self,))
+
+    @property
+    def right(self):
+        """Column of the last pixel inside the rectangle."""
+        return self.X + self.Width - 1
+
+    @property
+    def bottom(self):
+        """Row of the last pixel inside the rectangle."""
+        return self.Y + self.Height - 1
+
+    @property
+    def area(self):
+        return self.Width * self.Height
+
+    def contains(self, x, y):
+        return self.X <= x <= self.right and self.Y <= y <= self.bottom
+
+    def as_tuple(self):
+        return self.X, self.Y, self.Width, self.Height
+
+    def __repr__(self):
+        return 'Rectangle(X=%d, Y=%d, Width=%d, Height=%d)' % self.as_tuple()
 
 
 class Coordinate:
     def __init__(self, xin, yin):
         self.X = xin
         self.Y = yin
+
+    def __repr__(self):
+        return 'Coordinate(X=%r, Y=%r)' % (self.X, self.Y)
 
 
 class Transect:
@@ -88,75 +150,94 @@ class Transect:
 
 
 class RefImg:
+    """Reference image used for calibration: ``ImageIndex`` into the image list, ``Concentration`` in %."""
+
     def __init__(self, idx, con):
         self.ImageIndex = idx
         self.Concentration = con
 
+    def __repr__(self):
+        return 'RefImg(ImageIndex=%r, Concentration=%r)' % (self.ImageIndex, self.Concentration)
+
 
 class BitMap:
+    """Wrapper around a numpy image with C#-like ``Width``/``Height``/``Clone``/``GetPixel`` semantics."""
+
     def __init__(self, img):
+        if img is None:
+            raise ValueError('BitMap received None: the image could not be read. '
+                             'Check the path given to cv2.imread and the working directory.')
+        img = np.asarray(img)
+        if img.ndim not in (2, 3):
+            raise ValueError('BitMap expects a 2-D (grayscale) or 3-D (colour) array, got shape %r' % (img.shape,))
         self.Img = img
-        size = img.shape
-        self.Width = int(size[0])
-        self.Height = int(size[1])
-        if len(size) < 3:
+        self.Height = int(img.shape[0])  # rows
+        self.Width = int(img.shape[1])  # columns
+        if img.ndim == 2:
             self.Dimension = 2
             self.R = img[0, 0]
             self.G = img[0, 0]
             self.B = img[0, 0]
         else:
-            self.Dimension = int(size[2])
-            self.R = img[0, 0][0]
+            self.Dimension = int(img.shape[2])
+            self.B = img[0, 0][0]
             self.G = img[0, 0][1]
-            self.B = img[0, 0][2]
+            self.R = img[0, 0][2]
+
+    def check_rectangle(self, rect, what='target area'):
+        """Raise ``ValueError`` if ``rect`` does not lie completely inside the image."""
+        if rect.X < 0 or rect.Y < 0 or rect.right >= self.Width or rect.bottom >= self.Height:
+            raise ValueError('%s %r lies outside the image (%d columns x %d rows): columns %d-%d, rows %d-%d. '
+                             'Rectangle is (X=column, Y=row, Width, Height) as returned by cv2.selectROI.'
+                             % (what, rect, self.Width, self.Height, rect.X, rect.right, rect.Y, rect.bottom))
 
     def clone(self, rect):
-        return self.Img[rect.X:rect.X + rect.Width, rect.Y:rect.Y + rect.Height]
+        """Return the crop of ``rect`` (a view, like ``Bitmap.Clone``)."""
+        self.check_rectangle(rect)
+        return self.Img[rect.Y:rect.Y + rect.Height, rect.X:rect.X + rect.Width]
 
     def pixel(self, xin, yin, layer=''):
-        if self.Dimension == 3:
-            if layer == 'R':
-                pix = self.Img[xin, yin][0]
-            elif layer == 'G':
-                pix = self.Img[xin, yin][1]
-            else:
-                pix = self.Img[xin, yin][2]
-        else:
-            pix = self.Img[xin, yin]
-        return pix
+        """Pixel at column ``xin``, row ``yin``. ``layer`` selects 'R', 'G' or 'B' of a BGR image."""
+        if self.Dimension == 2:
+            return self.Img[yin, xin]
+        channel = {'R': 2, 'G': 1, 'B': 0}.get(layer, 2)
+        return self.Img[yin, xin][channel]
 
     def bitmaps(self, num):
         # type: (int) -> List[np.ndarray]
-        arr = []
-        for i in range(num):
-            arr.append(self.Img)
-        return arr
+        return [self.Img for _ in range(num)]
+
+
+# HSV ranges (OpenCV scale: H 0-180, S 0-255, V 0-255) used to isolate the dye of the particles.
+COLOR_RANGES = {
+    'red': (np.array([0, 100, 100]), np.array([10, 255, 255])),
+    'blue': (np.array([85, 100, 100]), np.array([130, 255, 255])),
+    'green': (np.array([50, 100, 100]), np.array([65, 255, 255])),
+    'yellow': (np.array([18, 100, 100]), np.array([38, 255, 255])),
+}
+
+# Blob detector settings used by MIQUOD for particle counting.
+DEFAULT_DETECTOR_SETTINGS = dict(threshold=[150, 255], flag_area=True, limit_area=[1, 50],
+                                 flag_circularity=False, min_cir=0.05, flag_convexity=False,
+                                 convexity=[0.01, 1], flag_inertia=False, ratio_inertia=[0.0, 1],
+                                 flag_color=False)
 
 
 class BlobDetector:
     """
-    This generates a blob detector based on given parameters tuned for
-    this particular project
-    :param threshold: Convert the source to several binary images. Starting at minThreshold. These thresholds are
-    incremented  by thresholdStep until maxThreshold.
-    :param flag_area: if 1, and appropriate values for minArea  and maxArea. E.g.  setting minArea  = 100 will filter
-    out all the blobs that have less then 100 pixels.
-    :param limit_area: values of min and max area to filter
-    :param flag_circularity: Set 1.  Then set appropriate values for minCircularity and maxCircularity.
-    :param min_cir: Circularity is defined as 4*pi*Area/(perimeter^2). E.g. circle has 1 and square 0.785
-    :param flag_convexity: , set 1, followed by setting 0 ≤ minConvexity ≤ 1 and maxConvexity ( ≤ 1)
-    :param convexity: is defined as the (Area of the Blob / Area of it’s convex hull). Now, a circle is convex
-    :param flag_inertia: set 1, and set 0 ≤ minInertiaRatio ≤ 1 and maxInertiaRatio (≤ 1 ) appropriately
-    :param ratio_inertia: how elongated a shape is. E.g. for a circle_value is 1, ellipse is between 0 and 1, line is 0.
-    :param flag_color: flag_color = 1. Set blobColor = 0 for darker blobs, and blobColor = 255 for lighter blobs.
-    :return: blob detector
+    Wrapper around ``cv2.SimpleBlobDetector`` tuned for this project.
 
+    :param threshold: ``[minThreshold, maxThreshold]`` of the internal binarisation steps.
+    :param flag_area: filter blobs by area, between ``limit_area[0]`` and ``limit_area[1]`` pixels.
+    :param flag_circularity: filter by circularity (4*pi*Area/perimeter^2), minimum ``min_cir``.
+    :param flag_convexity: filter by convexity (area / convex hull area) within ``convexity``.
+    :param flag_inertia: filter by inertia ratio (elongation) within ``ratio_inertia``.
+    :param flag_color: filter by colour; ``blobColor`` is 0 (dark blobs).
     """
 
     def __init__(self, threshold=None, flag_area=False, limit_area=None, flag_circularity=False, min_cir=0.1,
                  flag_convexity=False, convexity=None, flag_inertia=True, ratio_inertia=None,
                  flag_color=False):
-        # Default values
         if ratio_inertia is None:
             ratio_inertia = [0.0, 0.5]
         if convexity is None:
@@ -165,30 +246,24 @@ class BlobDetector:
             limit_area = [25, 25 * 35]
         if threshold is None:
             threshold = [120, 255]
-        # Setup SimpleBlobDetector parameters.
         params = cv2.SimpleBlobDetector_Params()
         # Current OpenCV rejects a minimum of exactly 0 for these ratios, even when the filter is disabled.
         min_ratio = 1e-6
 
-        # Change thresholds
         params.minThreshold = threshold[0]
         params.maxThreshold = threshold[1]
 
-        # Filter by Area. [4, 1000]
         params.filterByArea = flag_area
         params.minArea = limit_area[0]
         params.maxArea = limit_area[1]
 
-        # Filter by Circularity
         params.filterByCircularity = flag_circularity
         params.minCircularity = max(min_cir, min_ratio)
 
-        # Filter by Convexity
         params.filterByConvexity = flag_convexity
         params.minConvexity = max(convexity[0], min_ratio)
         params.maxConvexity = convexity[1]
 
-        # Filter by Inertia (ratio of widest to thinnest point)
         params.filterByInertia = flag_inertia
         params.minInertiaRatio = max(ratio_inertia[0], min_ratio)
         params.maxInertiaRatio = ratio_inertia[1]
@@ -196,8 +271,6 @@ class BlobDetector:
         params.filterByColor = flag_color
         params.blobColor = 0
 
-        # Create a detector with the parameters
-        # noinspection PyUnresolvedReferences
         ver = cv2.__version__.split('.')
         if int(ver[0]) < 3:
             self.detector = cv2.SimpleBlobDetector(params)
@@ -209,38 +282,215 @@ class BlobDetector:
 
     @staticmethod
     def rectangles(points):
-        aux = []
-        for item in points:
-            aux.append(
-                Rectangle(int(item.pt[0] - item.size / 2), int(item.pt[1] - item.size / 2), item.size, item.size))
-        return aux
+        return [Rectangle(int(item.pt[0] - item.size / 2), int(item.pt[1] - item.size / 2), item.size, item.size)
+                for item in points]
 
 
 # endregion
-# region Mixing quantification measures Particle data
-def mixing_dim_particle_data(store_trg_areas, loaded_img_info, store_part_pos, max_striation_thick):
+# region numpy helpers
+
+
+def _points_to_array(points):
+    """List of ``Point`` -> float array of shape (n, 2) with columns (X, Y)."""
+    if len(points) == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+    return np.array([(p.X, p.Y) for p in points], dtype=np.float64)
+
+
+def _min_sq_dist_to_set(query, pts, exclude_self=False, chunk=512):
+    """Minimum squared distance from each row of ``query`` to the rows of ``pts`` (chunked)."""
+    out = np.empty(len(query), dtype=np.float64)
+    for start in range(0, len(query), chunk):
+        q = query[start:start + chunk]
+        d2 = (q[:, None, 0] - pts[None, :, 0]) ** 2 + (q[:, None, 1] - pts[None, :, 1]) ** 2
+        if exclude_self:
+            idx = np.arange(len(q))
+            d2[idx, start + idx] = np.inf
+        out[start:start + chunk] = d2.min(axis=1)
+    return out
+
+
+def _crop(array, rect):
+    """Crop a numpy image (rows, cols, ...) with a ``Rectangle``."""
+    return array[rect.Y:rect.Y + rect.Height, rect.X:rect.X + rect.Width]
+
+
+# endregion
+# region Particle detection
+
+
+def detect_particles_in_target(crop_bgr, threshold_value, color='red', detector=None, hsv_range=None):
+    """
+    Detect the particles of one target area.
+
+    The pipeline is the one of MIQUOD v2.0: HSV mask of the dye colour, grayscale, 2x2 dilation and
+    erosion, inverse binary threshold at ``threshold_value``, then ``cv2.SimpleBlobDetector``.
+
+    :param crop_bgr: BGR crop of the target area.
+    :param threshold_value: gray threshold (0-255) applied before blob detection.
+    :param color: key of ``COLOR_RANGES`` ('red', 'blue', 'green', 'yellow').
+    :param detector: a ``BlobDetector``; defaults to ``BlobDetector(**DEFAULT_DETECTOR_SETTINGS)``.
+    :param hsv_range: optional ``(lower, upper)`` HSV arrays overriding ``color``.
+    :return: ``(key_points, stages)`` where ``stages`` is an ordered dict of the intermediate images
+             ('crop', 'mask', 'color', 'gray', 'binary', 'particles') relative to the crop.
+    """
+    if crop_bgr is None or crop_bgr.ndim != 3:
+        raise ValueError('detect_particles_in_target needs a BGR colour image')
+    if detector is None:
+        detector = BlobDetector(**DEFAULT_DETECTOR_SETTINGS)
+    if hsv_range is None:
+        if color not in COLOR_RANGES:
+            raise ValueError('unknown colour %r; choose one of %s' % (color, sorted(COLOR_RANGES)))
+        hsv_range = COLOR_RANGES[color]
+    lower, upper = hsv_range
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.asarray(lower), np.asarray(upper))
+    masked = cv2.bitwise_and(crop_bgr, crop_bgr, mask=mask)
+    gray = cv2.cvtColor(masked, cv2.COLOR_BGR2GRAY)
+    kernel = np.ones((2, 2), np.uint8)
+    morph = cv2.dilate(gray, kernel, iterations=1)
+    morph = cv2.erode(morph, kernel, iterations=1)
+    _, binary = cv2.threshold(morph, threshold_value, 255, cv2.THRESH_BINARY_INV)
+    key_points = detector.detect_blobs(binary)
+    annotated = annotate_particles(crop_bgr, key_points)
+    stages = {'crop': crop_bgr, 'mask': mask, 'color': masked, 'gray': gray, 'binary': binary,
+              'particles': annotated}
+    return key_points, stages
+
+
+def annotate_particles(image_bgr, key_points, color=(255, 255, 255), thickness=4):
+    """Return a copy of ``image_bgr`` with a circle drawn around each key point."""
+    out = image_bgr.copy()
+    for point in key_points:
+        cv2.circle(out, (int(point.pt[0]), int(point.pt[1])), max(int(point.size), 1), color, thickness)
+    return out
+
+
+def draw_particles(image_bgr, points, radius=4, color=(255, 255, 255), thickness=2, rect=None):
+    """Draw absolute particle positions (list of ``Point``) on a copy of the full image, optionally with the target."""
+    out = image_bgr.copy()
+    for p in points:
+        cv2.circle(out, (int(p.X), int(p.Y)), radius, color, thickness)
+    if rect is not None:
+        cv2.rectangle(out, (rect.X, rect.Y), (rect.right, rect.bottom), (0, 255, 255), 3)
+    return out
+
+
+def show_detection_stages(stages, title=''):
+    """Display the intermediate images of ``detect_particles_in_target`` with matplotlib (blocking)."""
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(2, 3, figsize=(13, 8))
+    for ax, (name, im) in zip(axes.flat, stages.items()):
+        if im.ndim == 3:
+            ax.imshow(cv2.cvtColor(im, cv2.COLOR_BGR2RGB))
+        else:
+            ax.imshow(im, cmap='gray')
+        ax.set_title(name)
+        ax.axis('off')
+    fig.suptitle(title)
+    plt.tight_layout()
+    plt.show()
+
+
+def blob_detection_image(img_to_process, threshold_value, store_target_areas, color='red', detector=None,
+                         show=False, out_dir=None, verbose=True, stages_out=None):
+    """
+    Detect the particles of every target of every image.
+
+    :param img_to_process: list of ``BitMap``.
+    :param threshold_value: gray threshold (0-255) applied before blob detection.
+    :param store_target_areas: ``store_target_areas[image][target]`` -> ``Rectangle``.
+    :param color: dye colour of the particles, key of ``COLOR_RANGES``.
+    :param detector: optional ``BlobDetector`` (default ``DEFAULT_DETECTOR_SETTINGS``).
+    :param show: display the intermediate images of each target with matplotlib (blocks).
+    :param out_dir: if given, write the intermediate images there as
+                    ``img{i}_target{j}_{k}_{stage}.jpg``.
+    :param verbose: print the number of particles found in each target.
+    :param stages_out: optional list; receives the intermediate images of every target as
+                       ``stages_out[image][target]`` (dict, see ``detect_particles_in_target``).
+    :return: ``(store_part_pos, store_blob_rectangles)``, both indexed ``[image][target]``.
+             Particle positions are absolute ``Point(column, row)`` of the full image.
+    """
+    store_blob_rectangles = []  # type: List[List[List[Rectangle]]]
+    store_part_pos = []  # type: List[List[List[Point]]]
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    for index, img in enumerate(img_to_process):
+        if not isinstance(img, BitMap):
+            raise TypeError('img_to_process must contain BitMap objects, got %r' % type(img))
+        store_blob_rectangles.append([])
+        store_part_pos.append([])
+        if stages_out is not None:
+            stages_out.append([])
+        for trg_ind, area in enumerate(store_target_areas[index]):
+            crop = img.clone(area)
+            key_points, stages = detect_particles_in_target(crop, threshold_value, color, detector)
+            if stages_out is not None:
+                stages_out[index].append(stages)
+            positions = [Point(area.X + int(kp.pt[0]), area.Y + int(kp.pt[1])) for kp in key_points]
+            rectangles = [Rectangle(area.X + int(kp.pt[0] - kp.size / 2), area.Y + int(kp.pt[1] - kp.size / 2),
+                                    max(kp.size, 1), max(kp.size, 1)) for kp in key_points]
+            store_part_pos[index].append(positions)
+            store_blob_rectangles[index].append(rectangles)
+            if verbose:
+                print('Image %d, target %d (%r): %d particles detected' % (index, trg_ind, area, len(positions)))
+            if len(positions) == 0:
+                warnings.warn('Image %d, target %d: no particles detected; the particle measures cannot be '
+                              'computed for this target (try another threshold or colour).' % (index, trg_ind))
+            if out_dir:
+                for k, (name, im) in enumerate(stages.items(), start=1):
+                    cv2.imwrite(os.path.join(out_dir, 'img%d_target%d_%d_%s.jpg' % (index, trg_ind, k, name)), im)
+            if show:
+                show_detection_stages(stages, 'Image %d, target %d: %d particles' % (index, trg_ind, len(positions)))
+    return store_part_pos, store_blob_rectangles
+
+
+# endregion
+# region Mixing quantification measures: particle data
+
+
+def mixing_dim_particle_data(store_trg_areas, loaded_img_info, store_part_pos, max_striation_thick, verbose=True):
+    """
+    Compute every particle-data measure and return them in a dictionary.
+
+    Keys: ``particle_concentration``, ``intensity_measures`` (``[σ, CoV, M, Cm, Cmax, Cmin, n, N]``),
+    ``max_striation_thickness``, ``pnn_distribution``, ``scale_segregation_indexes``
+    (``[σ_fpp, i_dis, xg]``) and ``pnn_parameters``; all indexed ``[image][target]``.
+    """
     store_con_particle_data = get_concentration_from_particles(store_trg_areas, loaded_img_info, store_part_pos,
                                                                max_striation_thick)
-    print('Concentration from particles')
     intensity_measures = segregation_intensity_ifp(store_con_particle_data, store_part_pos, store_trg_areas)
-    print(intensity_measures)
-    print("σ: ", intensity_measures[0][0][0])
-    print("CoV: ", intensity_measures[0][0][1])
-    print("M: ", intensity_measures[0][0][2])
-    print("Cm: ", intensity_measures[0][0][3])
-    print("Cmax: ", intensity_measures[0][0][4])
-    print("Cmin: ", intensity_measures[0][0][5])
-    print("n: ", intensity_measures[0][0][6])
-    print("N: ", intensity_measures[0][0][7])
     store_max_str_thick = maximum_striation_thickness(max_striation_thick)
-    print('Max str thickness: ', store_max_str_thick)
     pnn_distribution = pnn_method_distribution(store_trg_areas, store_part_pos)
-    # print('PNN distribution: ', pnn_distribution)
-    scl_segregation_ind = scale_segregation_for_particles(store_trg_areas, store_part_pos, pnn_distribution)
-    print('Scale segregation index [σ_fpp, i_dis, xg]')
-    print("σ_fpp:", scl_segregation_ind[0][0])
-    print("i_dis:", scl_segregation_ind[0][1])
-    print("xg:", scl_segregation_ind[0][2])
+    scl_segregation_ind, pnn_parameters = _scale_segregation_with_parameters(store_trg_areas, store_part_pos,
+                                                                              pnn_distribution)
+    results = {
+        'particle_concentration': store_con_particle_data,
+        'intensity_measures': intensity_measures,
+        'max_striation_thickness': store_max_str_thick,
+        'pnn_distribution': pnn_distribution,
+        'scale_segregation_indexes': scl_segregation_ind,
+        'pnn_parameters': pnn_parameters,
+    }
+    if verbose:
+        print(summarize_particle_results(results, loaded_img_info))
+    return results
+
+
+def summarize_particle_results(results, loaded_img_info=None):
+    """Human-readable summary of the dictionary returned by ``mixing_dim_particle_data``."""
+    lines = []
+    for i, per_image in enumerate(results['intensity_measures']):
+        name = loaded_img_info[i] if loaded_img_info and i < len(loaded_img_info) else 'Img%d' % (i + 1)
+        for j, im in enumerate(per_image):
+            lines.append('%s, target %d (particle data)' % (name, j))
+            lines.append('  Particles N: %d   quadrats n: %d   max. striation thickness: %s px'
+                         % (im[7], im[6], results['max_striation_thickness'][i][j]))
+            lines.append('  σ: %.6g   CoV: %.6g   M: %.6g' % (im[0], im[1], im[2]))
+            lines.append('  Cm: %.6g   Cmax: %.6g   Cmin: %.6g' % (im[3], im[4], im[5]))
+            s = results['scale_segregation_indexes'][i][j]
+            lines.append('  σ_fpp: %.6g   i_dis: %.6g   xg: %.6g' % (s[0], s[1], s[2]))
+    return '\n'.join(lines)
 
 
 '''%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -248,32 +498,21 @@ def mixing_dim_particle_data(store_trg_areas, loaded_img_info, store_part_pos, m
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%'''
 
 
-# noinspection PyTypeChecker
 def segregation_intensity_ifp(store_con_particle_data, store_part_positions, store_trg_areas):
     """
-        CALCULATION OF SEGREGATION INTENSITY INDEX MEASURES
-            Inputs:
-            ∙ Concentration matrix (Particles/Area in a Quadrat)
+    CALCULATION OF SEGREGATION INTENSITY INDEX MEASURES (particle data)
 
-            Output:
-            ∙ Segregation Intensity Index factors = [σ, cov, m, ...] =
-              [St. dev., Cof. of Variance, Mixing Index, ...]
-            ∙ Other Target factors = [...,cm, c_max, c_min, n, NumOfParticles]
-              [..., Mean Concentration, Max. Con. Value found, Min. Con. Value found, Number of measured points,
-               Number of particles ]
-        """
-    # Define the  intensity_measures List
+    Input: concentration matrix (particles / area in each quadrat).
+    Output: ``intensity_measures[image][target] = [σ, CoV, M, Cm, Cmax, Cmin, n, N]``
+    (standard deviation, coefficient of variation, mixing index clamped at 0, mean concentration,
+    maximum and minimum quadrat concentration, number of quadrats, number of particles).
+    """
     intensity_measures = []
-    i = 0
-    for List1 in store_con_particle_data:
-        # noinspection PyTypeChecker
-        intensity_measures.append([[]])
-        j = 0
-        for item in List1:
-            # Get number of particles and target area
-            num_of_part = store_part_positions[i][j].__len__()
+    for i, per_image in enumerate(store_con_particle_data):
+        intensity_measures.append([])
+        for j, item in enumerate(per_image):
+            num_of_part = len(store_part_positions[i][j])
             tgt_area = store_trg_areas[i][j].Width * store_trg_areas[i][j].Height
-            # Get mean and standard deviation of the previous matrix ----------------------------------------
             stat_measure = statistical_measures_particles(item, tgt_area, num_of_part)
             cm = stat_measure[0]
             st_dev = stat_measure[1]
@@ -283,16 +522,9 @@ def segregation_intensity_ifp(store_con_particle_data, store_part_positions, sto
                 cov = st_dev / cm
                 m = 1 - cov
                 m = 0 if m < 0 else m
-            c_max = stat_measure[3]
-            c_min = stat_measure[2]
-            n = stat_measure[4]
-            int_measures = [st_dev, cov, m, cm, c_max, c_min, n, num_of_part]
-            intensity_measures[i][j] = int_measures
-            j = j + 1
-        i = i + 1
+            intensity_measures[i].append([st_dev, cov, m, cm, stat_measure[3], stat_measure[2], stat_measure[4],
+                                          num_of_part])
     return intensity_measures
-    # NormalizeCoV()
-    # Defines intensity_measures[image_index][Target number]={σ, cov, m, cm, c_max, c_min, n, Num_Particles}
 
 
 '''%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -301,699 +533,432 @@ def segregation_intensity_ifp(store_con_particle_data, store_part_positions, sto
 
 
 def maximum_striation_thickness(max_str_thick):
-    """
-
-    :rtype: list
-    :param max_str_thick: max str thickness
-    :return: store_max_str_thick
-    """
-    store_max_str_thick = []
-    i = 0
-    for List1 in max_str_thick:
-        store_max_str_thick.append([])
-        for item in List1:
-            store_max_str_thick[i] = item
-        i = i + 1
-    return store_max_str_thick
-    # Defines store_max_str_thick[image_index][Target number]=Max. Striation Thickness
+    """Copy ``max_str_thick[image][target]`` (kept for compatibility with the original flow)."""
+    return [[int(item) for item in per_image] for per_image in max_str_thick]
 
 
 def pnn_method_distribution(store_trg_areas, store_part_pos):
     """
-    CALCULATION OF THE PNN METHOD
-    Inputs: 
-    ∙ Hexagonal grid 
-    ∙ Particle positions
+    CALCULATION OF THE PNN METHOD (Kukukova, 2011)
 
-    Output: 
-    ∙ PNN Distribution (Distance xi distribution from Grid Point to closest particles
-
-    Kukukova, 2011
+    For every point of the ideal hexagonal grid of a target, the distance ``xi`` to the closest
+    detected particle (bounded by the target diagonal).
+    Output: ``pnn_distribution[image][target]`` = numpy array of ``xi``.
     """
-    pnn_distribution = [[]]
-    i = 0
-    for List1 in store_trg_areas:
-        pnn_distribution[i].append([])
-        j = 0
-        for item in List1:
-            # Define ideal particle position points in an Hexagonal grid
-            num_of_part = store_part_pos[i][j].__len__()
-            # print('num oif part')
-            # print(num_of_part)
-            hexagonal_grid = ideal_particle_position(item, num_of_part)
-            xi = np.zeros(hexagonal_grid.__len__())
-            k = 0
-            for point in hexagonal_grid:
-                s = math.pow(item.Width, 2) + math.pow(item.Height, 2)
-                xi[k] = math.sqrt(s)
-                for point_eva in store_part_pos[i][j]:
-                    s = math.pow(point.X - point_eva.X, 2) + math.pow(point.Y - point_eva.Y, 2)
-                    dist = math.sqrt(s)
-                    if dist < xi[k]:
-                        xi[k] = dist
-                k = k + 1
-            pnn_distribution[i][j] = xi
-            j = j + 1
-        i = i + 1
+    pnn_distribution = []
+    for i, per_image in enumerate(store_trg_areas):
+        pnn_distribution.append([])
+        for j, item in enumerate(per_image):
+            pts = _points_to_array(store_part_pos[i][j])
+            if len(pts) == 0:
+                raise ValueError('Image %d, target %d: no particles detected, the PNN distribution cannot be '
+                                 'computed' % (i, j))
+            grid = _points_to_array(ideal_particle_position(item, len(pts)))
+            bound = math.sqrt(math.pow(item.Width, 2) + math.pow(item.Height, 2))
+            xi = np.minimum(np.sqrt(_min_sq_dist_to_set(grid, pts)), bound)
+            pnn_distribution[i].append(xi)
     return pnn_distribution
-    # Defines pnn_distribution[#of picture,#of target area]=>PNN Distribution
+
+
+def _scale_of_segregation(num_of_part, item, xi):
+    """Scale-of-segregation indexes of one target plus the intermediate PNN parameters."""
+    k = int(math.sqrt(num_of_part))
+    m = len(xi)
+    if k < 2 or m < 2:
+        raise ValueError('At least 4 particles are needed for the scale of segregation (PNN method), '
+                         '%d detected' % num_of_part)
+    dx = item.Width / (k * 1.0)
+    dy = item.Height / (k * 1.0)
+    xg = float((dx + 2 * math.sqrt(dx * dx + dy * dy)) / (3 * 1.0))  # spatial resolution
+    xr = xg / 2  # one half of the spatial resolution
+    above = xi[xi >= xr]
+    xs = float(np.sum((above - xr) ** 2))
+    xi_mean = float(np.sum(xi)) / (m * 1.0)
+    var_fpp = xs / ((m * 1.0) - 1)
+    if xi_mean == 0:
+        raise ValueError('Every grid point coincides with a particle: the index of dispersion is undefined')
+    i_dis = var_fpp / xi_mean
+    params = {'xr': xr, 'xg': xg, 'dx': dx, 'dy': dy, 'k': k, 'xs': xs, 'var_fpp': var_fpp,
+              'xi_mean': xi_mean, 'm': m}
+    return [math.sqrt(var_fpp), i_dis, xg], params
+
+
+def _scale_segregation_with_parameters(store_trg_areas, store_part_pos, pnn_distribution):
+    scl_segregation_ind = []
+    parameters = []
+    for i, per_image in enumerate(store_trg_areas):
+        scl_segregation_ind.append([])
+        parameters.append([])
+        for j, item in enumerate(per_image):
+            scale_dim, params = _scale_of_segregation(len(store_part_pos[i][j]), item, pnn_distribution[i][j])
+            scl_segregation_ind[i].append(scale_dim)
+            parameters[i].append(params)
+    return scl_segregation_ind, parameters
 
 
 def scale_segregation_for_particles(store_trg_areas, store_part_pos, pnn_distribution):
     """
-    CALCULATION OF SCALE OF SEGREGATION MEASURES
-    Inputs:
-    ∙ PNN Distribution
-    ∙ Hexagonal grid dimensions
+    CALCULATION OF SCALE OF SEGREGATION MEASURES (Kukukova 2011)
 
-
-    Output:
-    ∙ Scale of Segregation factors = [σ_fpp, i_dis, xg]
-      [Filtered point-particle deviation, Index of dispersion, Spatial resolution]
-    Kukukova 2011, 2017
+    Output: ``scl_segregation_ind[image][target] = [σ_fpp, i_dis, xg]``
+    (filtered point-particle deviation, index of dispersion, spatial resolution).
     """
-    scl_segregation_ind = []
-    i = 0
-    for List1 in store_trg_areas:
-        scl_segregation_ind.append([])
-        j = 0
-        for item in List1:
-            k = int(math.sqrt(store_part_pos[i][j].__len__()))
-            # Hexagonal Grid dimensions
-            dx = item.Width / (k * 1.0)
-            dy = item.Height / (k * 1.0)
-            # Calculate Spatial Resolution (xg)
-            xg = float((dx + 2 * math.sqrt(dx * dx + dy * dy)) / (3 * 1.0))
-            # Define array of indexes
-            scale_dim = [0.0, 0.0, 0.0]
-            m = pnn_distribution[i][j].__len__()
-            xs = 0
-            xr = xg / 2  # xr is equal to one-half of the spatial resolution
-            xi_mean = 0
-            for Xi in pnn_distribution[i][j]:
-                if Xi >= xr:
-                    xs = xs + math.pow(Xi - xr, 2)
-                xi_mean = xi_mean + Xi
-            xi_mean = xi_mean / (m * 1.0)
-            var_fpp = xs / ((m * 1.0) - 1)
-            i_dis = var_fpp / xi_mean
-            print("PNN_parameters [xr, xg, dx, dy, k, xs, var_fpp, xi_mean, m]:" + str(
-                [xr, xg, dx, dy, k, xs, var_fpp, xi_mean, m]))
-            scale_dim[0] = math.sqrt(var_fpp)  # σ_fpp -> Filtered point-particle deviation
-            scale_dim[1] = i_dis  # i_dis -> Index of dispersion
-            scale_dim[2] = xg  # xg -> Spatial resolution
-            scl_segregation_ind[i] = scale_dim
-            j = j + 1
-        i = i + 1
-    return scl_segregation_ind
+    return _scale_segregation_with_parameters(store_trg_areas, store_part_pos, pnn_distribution)[0]
 
 
 # endregion
-# region Auxiliar functions for Particle tracking calculations
-def calculate_mean_spacing(img_ind, trg, img_to_process, store_part_pos):
-    mean_spa = 0
-    for point in store_part_pos[img_ind][trg]:
-        s = math.pow(img_to_process[img_ind].Width, 2) + math.pow(img_to_process[img_ind].Height, 2)
-        mean_s = int(math.sqrt(s))
-        for point_evl in store_part_pos[img_ind][trg]:
-            if point != point_evl:
-                s = math.pow(point.X - point_evl.X, 2) + math.pow(point.Y - point_evl.Y, 2)
-                dist = int(math.sqrt(s))
-                if dist < mean_s:
-                    mean_s = dist
-        mean_spa = mean_spa + mean_s
+# region Auxiliary functions for particle tracking calculations
 
-    mean_spa = int(mean_spa / store_part_pos[img_ind][trg].__len__())
+
+def calculate_mean_spacing(img_ind, trg, img_to_process, store_part_pos):
+    """
+    Twice the mean (integer-truncated) nearest-neighbour distance between the particles of a target.
+    The distance of each particle is bounded by the image diagonal, as in the C# original.
+    """
+    pts = _points_to_array(store_part_pos[img_ind][trg])
+    n = len(pts)
+    if n < 2:
+        raise ValueError('Image %d, target %d: at least two particles are needed to compute the mean spacing, '
+                         '%d detected' % (img_ind, trg, n))
+    image = img_to_process[img_ind]
+    bound = int(math.sqrt(math.pow(image.Width, 2) + math.pow(image.Height, 2)))
+    nearest = np.floor(np.sqrt(_min_sq_dist_to_set(pts, pts, exclude_self=True)))
+    mean_s = np.minimum(nearest, bound)
+    mean_spa = int(mean_s.sum() / n)
     return mean_spa * 2
 
 
-def initiate_max_str_thickness(img_to_process, store_part_pos, store_trg_areas):
+def _striation_from_sorted(values, m_part_spacing):
+    """Maximum striation thickness of sorted 1-D coordinates: longest run of gaps <= spacing."""
+    if values.size <= 1:
+        return int(m_part_spacing)
+    gaps = np.diff(values)
+    cut = np.flatnonzero(gaps > m_part_spacing)
+    starts = np.concatenate(([0], cut + 1))
+    ends = np.concatenate((cut, [values.size - 1]))
+    mst = int((values[ends] - values[starts]).max())
+    return max(mst, int(m_part_spacing))
+
+
+def _max_striation_in_transect(pts, transect, horizontal, m_part_spacing):
+    inside = ((pts[:, 0] >= transect.X) & (pts[:, 0] <= transect.right) &
+              (pts[:, 1] >= transect.Y) & (pts[:, 1] <= transect.bottom))
+    values = np.sort(pts[inside, 0] if horizontal else pts[inside, 1])
+    return _striation_from_sorted(values, m_part_spacing)
+
+
+def _scan_transects(pts, rect, mean_s, horizontal=True):
+    """Slide a transect of thickness ``mean_s`` over the target; return the largest striation and its transect."""
+    x, y, width_t, height_t = rect.X, rect.Y, rect.Width, rect.Height
+    if horizontal:
+        height, width, ini, limit = mean_s, width_t, y, y + height_t - 1 - mean_s
+        axis, other, lo_other, hi_other = 1, 0, x, rect.right
+    else:
+        height, width, ini, limit = height_t, mean_s, x, x + width_t - 1 - mean_s
+        axis, other, lo_other, hi_other = 0, 1, y, rect.bottom
+    keep = (pts[:, other] >= lo_other) & (pts[:, other] <= hi_other)
+    p = pts[keep]
+    p = p[np.argsort(p[:, axis], kind='stable')]
+    band = p[:, axis]
+    thickness = height if horizontal else width
+    mst = int(mean_s)
+    best = None
+    last = None
+    for j in range(ini, limit):
+        lo = np.searchsorted(band, j, 'left')
+        hi = np.searchsorted(band, j + thickness - 1, 'right')
+        mst_evl = _striation_from_sorted(np.sort(p[lo:hi, other]), mean_s)
+        last = Rectangle(x, j, width, height) if horizontal else Rectangle(j, y, width, height)
+        if mst_evl > mst:
+            mst = mst_evl
+            best = last
+    if best is None:
+        best = last if last is not None else Rectangle(x, y, width, height)
+    return mst, best
+
+
+def initiate_max_str_thickness(img_to_process, store_part_pos, store_trg_areas, horizontal=True):
+    """
+    Mean particle spacing and maximum striation thickness of every target.
+
+    Transects of thickness equal to the mean spacing are slid over the whole target (row by row for
+    ``horizontal``) and the largest striation thickness found is kept.
+    :return: ``(mean_spacing, defined_transects, max_str_thickness)``, each indexed ``[image][target]``.
+             ``defined_transects`` holds the transect where the maximum was found.
+    """
     defined_transects = []
     m_part_spacing = []
     max_str_thickness = []
-    horizontal = True
-    for img_ind in range(img_to_process.__len__()):
+    for img_ind in range(len(img_to_process)):
         defined_transects.append([])
         max_str_thickness.append([])
         m_part_spacing.append([])
-        tgt_ind = 0
-        while tgt_ind < store_trg_areas[img_ind].__len__():
+        for tgt_ind, rect in enumerate(store_trg_areas[img_ind]):
+            img_to_process[img_ind].check_rectangle(rect)
             mean_s = calculate_mean_spacing(img_ind, tgt_ind, img_to_process, store_part_pos)
-            m_part_spacing[img_ind].append([])
-            max_str_thickness[tgt_ind].append([])
-            # noinspection PyTypeChecker
-            m_part_spacing[img_ind][tgt_ind] = mean_s
-            # Define new Rectangle Transect for the assessed target
-            defined_transects[img_ind].append([])
-            # Evaluate for all the transect positions possible
-            x = store_trg_areas[img_ind][tgt_ind].X
-            y = store_trg_areas[img_ind][tgt_ind].Y
-            if horizontal:
-                height = mean_s
-                width = store_trg_areas[img_ind][tgt_ind].Width
-                ini = y
-                limit = y + store_trg_areas[img_ind][tgt_ind].Height - 1 - mean_s
-            else:
-                height = store_trg_areas[img_ind][tgt_ind].Height
-                width = mean_s
-                ini = x
-                limit = x + store_trg_areas[img_ind][tgt_ind].Width - 1 - mean_s
-            mst = mean_s
-            j = ini
-            while j < limit:
-                if horizontal:
-                    rect_t = Rectangle(x, j, width, height)
-                else:
-                    rect_t = Rectangle(j, y, width, height)
-                # noinspection PyTypeChecker
-                defined_transects[img_ind][tgt_ind] = rect_t
-                mst_evl = calculate_max_str_thickness(img_ind, tgt_ind, mean_s, store_part_pos, defined_transects,
-                                                      store_trg_areas)
-                if mst_evl > mst:
-                    mst = mst_evl
-                j = j + 1
-            max_str_thickness[img_ind][tgt_ind] = mst
-            tgt_ind = tgt_ind + 1
+            pts = _points_to_array(store_part_pos[img_ind][tgt_ind])
+            mst, transect = _scan_transects(pts, rect, mean_s, horizontal)
+            m_part_spacing[img_ind].append(mean_s)
+            defined_transects[img_ind].append(transect)
+            max_str_thickness[img_ind].append(mst)
     return m_part_spacing, defined_transects, max_str_thickness
 
 
 def calculate_max_str_thickness(img_ind, trg_ind, m_part_spacing, store_part_pos, defined_transects, store_trg_areas):
-    horizontal = True
-    # Evaluate if is horizontal or Vertical
-    if defined_transects[img_ind][trg_ind].Height == store_trg_areas[img_ind][trg_ind].Height:
-        horizontal = False
-    array = []
-    ind_tgt = 0
-    j = 0
-    for item in store_part_pos[img_ind][trg_ind]:
-        x1 = defined_transects[img_ind][trg_ind].X
-        x2 = x1 + defined_transects[img_ind][trg_ind].Width - 1
-        y1 = defined_transects[img_ind][trg_ind].Y
-        y2 = y1 + defined_transects[img_ind][trg_ind].Height - 1
-        if x1 <= item.X <= x2 and y1 <= item.Y <= y2:
-            array.append(0)  # Adds one more space into the array
-            if horizontal:
-                array[j] = item.X
-            else:
-                array[j] = item.Y
-            j = j + 1
-        ind_tgt = ind_tgt + 1
-    if array.__len__() > 1:
-        array.sort()
-        mst = 0
-        start = array[0]
-        ind_tgt = 1
-        while ind_tgt < array.__len__():
-            striation = array[ind_tgt] - array[ind_tgt - 1]
-            if striation > m_part_spacing:
-                if array[ind_tgt - 1] - start > mst:
-                    mst = array[ind_tgt - 1] - start
-                start = array[ind_tgt]
-
-            if ind_tgt == array.__len__() - 1:
-                if array[ind_tgt] - start > mst:
-                    mst = array[ind_tgt] - start
-            ind_tgt = ind_tgt + 1
-        if mst < m_part_spacing:
-            mst = m_part_spacing
-    else:
-        mst = m_part_spacing
-    return mst
+    """Maximum striation thickness of the particles inside ``defined_transects[img_ind][trg_ind]``."""
+    transect = defined_transects[img_ind][trg_ind]
+    horizontal = transect.Height != store_trg_areas[img_ind][trg_ind].Height
+    pts = _points_to_array(store_part_pos[img_ind][trg_ind])
+    return _max_striation_in_transect(pts, transect, horizontal, m_part_spacing)
 
 
 def get_concentration_from_particles(store_target_areas, loaded_image_info, store_part_positions,
                                      max_striation_thickness):
-    # Copy Images, Images Info and Stored targets
-    store_target_areas2 = []
-    f = 0
-    for List1 in store_target_areas:
-        store_target_areas2.append([[]])
-        for item in List1:
-            store_target_areas2[f] = item
-        f = f + 1
-    loaded_image_info2 = []
-    for item in loaded_image_info:
-        loaded_image_info2.append(item)
-    # Compute concentration matrix from particle distribution
+    """
+    Particle concentration matrix of every target: the target is divided into square quadrats of
+    side equal to the maximum striation thickness (centred in the target) and each quadrat holds
+    ``particles / quadrat area``. Output shape is ``(columns, rows)`` of quadrats, indexed ``[x][y]``.
+    """
     store_con_particle_data = []
-    i = 0
-    while i < store_target_areas.__len__():
-        store_con_particle_data.append([[]])
-        j = 0
-        for item in store_target_areas[i]:
-            mst = max_striation_thickness[i][j]
-            width = item.Width
-            height = item.Height
-            # Define the number of columns and rows in each target
+    for i, per_image in enumerate(store_target_areas):
+        store_con_particle_data.append([])
+        for j, item in enumerate(per_image):
+            mst = int(max_striation_thickness[i][j])
+            width, height = item.Width, item.Height
             col = math.floor(width / mst)
-            dist_x = (width - col * mst) / 2
             row = math.floor(height / mst)
-            dist_y = (height - row * mst) / 2
-            concentration = np.zeros(shape=(col, row))
-            n = 1
-            while n <= row:
-                y_cmp = store_target_areas[i][j].Y + dist_y
-                y_start = y_cmp + (n - 1) * mst - 1
-                y_limit = y_cmp + n * mst - 1
-                m = 1
-                while m <= col:
-                    x_comp = store_target_areas[i][j].X + dist_x
-                    x_start = x_comp + (m - 1) * mst - 1
-                    x_limit = x_comp + m * mst - 1
-                    nn = 0
-                    for part in store_part_positions[i][j]:
-                        x = part.X
-                        y = part.Y
-                        if x_start <= x < x_limit and y_start <= y < y_limit:
-                            nn = nn + 1
-                    area = mst * mst
-                    concentration[m - 1][n - 1] = nn / (area * 1.0)
-                    m = m + 1
-                n = n + 1
-            store_con_particle_data[i][j] = concentration
-            j = j + 1
-        i = i + 1
+            if col < 1 or row < 1:
+                raise ValueError('Image %d, target %d: the maximum striation thickness (%d px) is larger than the '
+                                 'target (%d x %d px); no quadrat fits' % (i, j, mst, width, height))
+            pts = _points_to_array(store_part_positions[i][j]).astype(np.int64)
+            # quadrat (m-1, n-1) covers x in [X + dist_x + (m-1)*mst - 1, X + dist_x + m*mst - 1)
+            # with dist_x = (width - col*mst) / 2; computed with integers (times 2) to avoid rounding.
+            bx = (2 * pts[:, 0] - 2 * item.X - (width - col * mst) + 2) // (2 * mst)
+            by = (2 * pts[:, 1] - 2 * item.Y - (height - row * mst) + 2) // (2 * mst)
+            valid = (bx >= 0) & (bx < col) & (by >= 0) & (by < row)
+            counts = np.zeros((col, row), dtype=np.float64)
+            np.add.at(counts, (bx[valid], by[valid]), 1.0)
+            store_con_particle_data[i].append(counts / float(mst * mst))
     return store_con_particle_data
 
 
 def statistical_measures_particles(data, target_area, num_of_particles):
     """
-    COMPUTE STATISTICAL MEASURES 
-
-    StatisticalArray=[μ,σ,x_min,x_max,n]=[Mean, Std. Dev., Min Value, Max Value, Number of Data] = [0,1,2,3,4]
-    
-    :rtype: float list
-    :type data: float list
-    :param data: array
-    :param target_area: integer target area
-    :param num_of_particles: integer number of particles
-    :return: stat_measures Statistical measures array
+    ``[μ, σ, x_min, x_max, n]`` of a particle concentration matrix, where ``μ`` is the global
+    concentration ``num_of_particles / target_area`` and ``σ`` the population deviation about it.
     """
-    # Define variables
-    st_dev = 0
-    x_max = 0
-    x_min = data[0][0]
-    n = 0
-    stat_measures = [0.0, 0.0, 0.0, 0.0, 0.0]
-    # Calculate mean value
+    data = np.asarray(data, dtype=np.float64)
+    if data.size == 0:
+        raise ValueError('the particle concentration matrix is empty')
     mean_v = num_of_particles / float(target_area)
-    # Find n, x_max & x_min and Compute Standard deviation
-    xc = 0
-    while xc < data.shape[0]:
-        yc = 0
-        while yc < data.shape[1]:
-            st_dev = st_dev + (data[xc][yc] - mean_v) ** 2
-            if x_max < data[xc][yc]:
-                x_max = data[xc][yc]
-            if x_min > data[xc][yc]:
-                x_min = data[xc][yc]
-            n = n + 1
-            yc = yc + 1
-        xc = xc + 1
-    st_dev = (st_dev / n) ** 0.5
-    stat_measures[0] = mean_v
-    stat_measures[1] = st_dev
-    stat_measures[2] = x_min
-    stat_measures[3] = x_max
-    stat_measures[4] = n
-    return stat_measures
+    st_dev = math.sqrt(float(np.sum((data - mean_v) ** 2)) / data.size)
+    x_max = max(0.0, float(data.max()))
+    x_min = float(data.min())
+    return [mean_v, st_dev, x_min, x_max, data.size]
 
 
 def ideal_particle_position(tgt_area, num_of_part):
     """
-
-    :rtype: list
-    :param tgt_area: rectangle structure c#
-    :param num_of_part: integer number of particles
-    :return: ideal_part_pos float list
+    Ideal hexagonal grid of ``k*k`` points (``k = int(sqrt(num_of_part))``) inside the target.
+    Odd rows are shifted by half the horizontal spacing. Returns a list of ``Point`` (floats).
     """
     k = int(num_of_part ** 0.5)
-    # print(k)
-    x = tgt_area.X
-    y = tgt_area.Y
-    width = tgt_area.Width
-    height = tgt_area.Height
+    if k < 1:
+        raise ValueError('at least one particle is needed to build the hexagonal grid')
+    x, y, width, height = tgt_area.X, tgt_area.Y, tgt_area.Width, tgt_area.Height
     dist_x = width / (k * 1.0)
     dist = (width - int(math.ceil((dist_x - 1) / 2.0)) - (k - 1) * dist_x) / 2.0
     ini_x = x + int(math.ceil(dist))
     dist_y = height / (k * 1.0)
     dist = int(math.ceil(((height - dist_y * k) / 2.0)))
     ini_y = y + dist + int(math.ceil(dist_y / 2.0))
-    ideal_part_pos = ListPoints(0, 0).list_points(k * k)  # point structure
-    # print(ideal_part_pos.__len__())
-    i = 0
-    n = 0
-    while n < k:
-        y_part = ini_y + n * dist_y
-        m = 0
-        while m < k:
-            if n % 2 == 0:
-                x_part = ini_x + m * dist_x
-            else:
-                x_part = (ini_x + dist_x / 2) + (m * dist_x)
-            ideal_part_pos[i] = Point(x_part, y_part)  # point structure
-            i = i + 1
-            m = m + 1
-        n = n + 1
-    return ideal_part_pos
+    n = np.arange(k)[:, None]
+    m = np.arange(k)[None, :]
+    y_part = np.broadcast_to(ini_y + n * dist_y, (k, k))
+    x_part = np.where(n % 2 == 0, ini_x + m * dist_x, (ini_x + dist_x / 2) + (m * dist_x))
+    return [Point(float(xp), float(yp)) for xp, yp in zip(x_part.ravel(), y_part.ravel())]
 
 
 # endregion
-# region Mixing quantification measures Concentration data
-
-def mixing_dim_concentration_data(img_to_process, store_target_areas, store_concentration_data, images_with_references,
-                                  loaded_img_info, dark_checkbox, intensity_measures, hor_var_diagrams,
-                                  ver_var_diagrams):
-    # "4. Compute measures" 
-    store_concentration_data = concentration_matrix(img_to_process, store_target_areas, store_concentration_data,
-                                                    images_with_references, loaded_img_info, dark_checkbox)
-    print('Concentration matrix')
-    intensity_measures = segregation_intensity_index_factors(intensity_measures, img_to_process,
-                                                             store_concentration_data)
-    print('segregation')
-    hor_var_diagrams = horizontal_var_diagram(hor_var_diagrams, store_concentration_data, img_to_process,
-                                              intensity_measures)
-
-    print('h diagram')
-    print(hor_var_diagrams)
-    ver_var_diagrams = vertical_var_diagram(ver_var_diagrams, img_to_process, store_concentration_data,
-                                            intensity_measures)
-
-    print('v diagram')
-    print(ver_var_diagrams)
-    m_length_scales = mean_length_scales(img_to_process, store_concentration_data, intensity_measures, hor_var_diagrams,
-                                         ver_var_diagrams)
-    exposure_indexes = calculate_exposure_indexes(img_to_process, store_concentration_data)
-    print('exposure completed')
-    print(exposure_indexes)
-    # ("Calculation completed")
-    print('intensity_measures')
-    print(intensity_measures)
-    print('mean_len_scales')
-    print(m_length_scales)
-    print('exposure_indexes')
-    print(exposure_indexes)
-    # Evaluate is there are negative Mixing Index
-    need_for_inlets = False
-    for List1 in intensity_measures:
-        for item in List1:  # type: List[float]
-            if item[1] > 1:
-                need_for_inlets = True
-
-    if need_for_inlets:
-        print(["There are negative Mixing Indexes (M < 0)", "\n", "\n",
-               "Please define the unmixed condition by defining the inlets"])
+# region Mixing quantification measures: concentration data
 
 
-def concentration_matrix(img_to_process, store_trg_areas, store_concentration_data, images_with_references,
-                         loaded_image_info, dark_checkbox):
-    # Copy Images, Images Info and Stored targets
-    store_target_areas2 = []
-    f = 0
-    for List1 in store_trg_areas:
-        store_target_areas2.append([Rectangle(0, 0, 1, 1)])
-        for item in List1:
-            store_target_areas2[f] = item
-        f = f + 1
-    loaded_image_info2 = []
-    for item in loaded_image_info:
-        loaded_image_info2.append(item)
-    # Define the  store_concentration_data List
-    if store_concentration_data.__len__() > 0:
-        store_concentration_data = []
-    i = 0
-    while i < img_to_process.__len__():
-        store_concentration_data.append([[]])
-        i = i + 1
-    # Determine if Images has to be calibrated
-    '''%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    ->ALL THE REFERENCE AND ASSESSED IMAGES MUST BE ASSIGNED IN THE images_with_references LIST 
-    ->ALSO EACH IMAGE TO BE CALIBRATED HAS TO HAVE AT LEAST TWO REFERENCE IMAGES
-    ->IF THERE ARE ONE IMAGE THAT HAS NOT BEING ASSIGNED IN THE images_with_references LIST,
-      THE CALIBRATION WILL NOT BE PERFORMED
-    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*/'''
+def mixing_dim_concentration_data(img_to_process, store_target_areas, store_concentration_data=None,
+                                  images_with_references=None, loaded_img_info=None, dark_checkbox=False,
+                                  intensity_measures=None, hor_var_diagrams=None, ver_var_diagrams=None,
+                                  verbose=True):
+    """
+    Compute every concentration-data measure and return them in a dictionary.
+
+    ``store_concentration_data``, ``intensity_measures``, ``hor_var_diagrams`` and ``ver_var_diagrams``
+    are accepted for compatibility with MIQUOD v2.0 scripts and ignored.
+
+    Keys: ``concentration_data``, ``intensity_measures`` (``[σ, CoV, M, Cm, Cmax, Cmin, n]``),
+    ``horizontal_variograms``, ``vertical_variograms``, ``mean_length_scales`` (``Coordinate`` with
+    ``X`` horizontal and ``Y`` vertical), ``exposure_indexes`` and ``need_for_inlets``.
+    """
+    concentration = concentration_matrix(img_to_process, store_target_areas, None, images_with_references,
+                                         loaded_img_info, dark_checkbox)
+    measures = segregation_intensity_index_factors(None, img_to_process, concentration)
+    hor = horizontal_var_diagram(None, concentration, img_to_process, measures)
+    ver = vertical_var_diagram(None, img_to_process, concentration, measures)
+    lengths = mean_length_scales(img_to_process, concentration, measures, hor, ver)
+    exposure = calculate_exposure_indexes(img_to_process, concentration)
+    need_for_inlets = any(item[1] > 1 for per_image in measures for item in per_image)
+    results = {
+        'concentration_data': concentration,
+        'intensity_measures': measures,
+        'horizontal_variograms': hor,
+        'vertical_variograms': ver,
+        'mean_length_scales': lengths,
+        'exposure_indexes': exposure,
+        'need_for_inlets': need_for_inlets,
+    }
+    if verbose:
+        print(summarize_concentration_results(results, loaded_img_info))
+    return results
+
+
+def summarize_concentration_results(results, loaded_img_info=None):
+    """Human-readable summary of the dictionary returned by ``mixing_dim_concentration_data``."""
+    lines = []
+    for i, per_image in enumerate(results['intensity_measures']):
+        name = loaded_img_info[i] if loaded_img_info and i < len(loaded_img_info) else 'Img%d' % (i + 1)
+        for j, im in enumerate(per_image):
+            lines.append('%s, target %d (concentration data)' % (name, j))
+            lines.append('  σ: %.6g   CoV: %.6g   M: %.6g   n: %d' % (im[0], im[1], im[2], im[6]))
+            lines.append('  Cm: %.6g   Cmax: %.6g   Cmin: %.6g' % (im[3], im[4], im[5]))
+            lms = results['mean_length_scales'][i][j]
+            lines.append('  mean length scale horizontal: %.6g   vertical: %.6g' % (lms.X, lms.Y))
+            lines.append('  exposure: %.6g' % results['exposure_indexes'][i][j])
+    if results.get('need_for_inlets'):
+        lines.append('There are negative mixing indexes (M < 0): define the unmixed condition (inlets) to '
+                     'normalise the CoV.')
+    return '\n'.join(lines)
+
+
+def _same_sizes_for_calibration(img_to_process, store_trg_areas, images_with_references):
+    """True when every image has the same size and target sizes as its reference images."""
+    for i, refs in enumerate(images_with_references):
+        for ref in refs:
+            a, b = img_to_process[i], img_to_process[ref.ImageIndex]
+            if a.Width != b.Width or a.Height != b.Height:
+                return False
+            if len(store_trg_areas[ref.ImageIndex]) < len(store_trg_areas[i]):
+                return False
+            for j, rect in enumerate(store_trg_areas[i]):
+                other = store_trg_areas[ref.ImageIndex][j]
+                if rect.Width != other.Width or rect.Height != other.Height:
+                    return False
+    return True
+
+
+def concentration_matrix(img_to_process, store_trg_areas, store_concentration_data=None, images_with_references=None,
+                         loaded_image_info=None, dark_checkbox=False):
+    """
+    Concentration array of every target, indexed ``[image][target]`` with shape ``(Width, Height)``.
+
+    * Without calibration (any image with a single reference, or not enough references), the gray
+      intensity of the median-filtered image is normalised with the minimum and maximum intensity of
+      the whole image: ``c = (I - Imin) / (Imax - Imin)`` (``1 - c`` when ``dark_checkbox``).
+    * With calibration, every image to be calibrated needs at least two ``RefImg`` (reference images of
+      known concentration, in %). If all images and targets have the same size a linear regression
+      intensity -> concentration is fitted pixel by pixel ("complex" calibration); otherwise one
+      regression per target uses the mean intensity of the reference targets ("simple" calibration).
+      Images without references (the reference images themselves) get an empty list.
+    """
+    n_img = len(img_to_process)
+    if images_with_references is None:
+        images_with_references = [[] for _ in range(n_img)]
+    if loaded_image_info is None:
+        loaded_image_info = ['Img%d' % (i + 1) for i in range(n_img)]
+    result = [[] for _ in range(n_img)]  # type: List[List[np.ndarray]]
+    for i in range(n_img):
+        for rect in store_trg_areas[i]:
+            img_to_process[i].check_rectangle(rect)
+
+    # Determine whether the images have to be calibrated (same rules as MIQUOD v1.0).
     cal_performed = True
     ims_in_calibration = 0
-    for item in images_with_references:
-        if item.__len__() == 1:
+    for refs in images_with_references:
+        if len(refs) == 1:
             cal_performed = False
-        if item.__len__() > 1:
-            ims_in_calibration = ims_in_calibration + item.__len__() + 1
-    if ims_in_calibration < loaded_image_info.__len__():
+        if len(refs) > 1:
+            ims_in_calibration = ims_in_calibration + len(refs) + 1
+    if ims_in_calibration < len(loaded_image_info):
         cal_performed = False
-    # region Performing Calibration: Calculate Concentrations using calibration data
+
     if cal_performed:
-        print('calibration')
-        # Determine what type of calibration is going to be performed (COMPLEX or SIMPLE)
-        cond1 = True
-        i = 0
-        for List1 in images_with_references:
-            for item in List1:
-                width = img_to_process[i].Width
-                height = img_to_process[i].Height
-                width2 = img_to_process[item.ImageIndex].Width
-                height2 = img_to_process[item.ImageIndex].Height
-                if width != width2 or height != height2:
-                    cond1 = False  # Images with different dimensions
-                j = 0
-                while j < store_trg_areas[i].__len__():
-                    tgt_width = store_trg_areas[i][j].Width
-                    tgt_height = store_trg_areas[i][j].Height
-                    tgt_width2 = store_trg_areas[item.ImageIndex][j].Width
-                    tgt_height2 = store_trg_areas[item.ImageIndex][j].Height
-                    if tgt_width != tgt_width2 or tgt_height != tgt_height2:
-                        cond1 = False
-                    j = j + 1
-            i = i + 1
-        # region COMPLEX Calibration: Same Image Size and Same Target Sizes (COMPLEX CALIBRATION)
-        if cond1:
-            img = 0
-            while img < img_to_process.__len__():
-                if images_with_references[img].__len__() > 0:
-                    # Image filtration
-                    filtered_image = img_to_process[img].clone(Rectangle(0, 0, img_to_process[img].Width,
-                                                                         img_to_process[img].Height))  # bitmap type
-                    # Apply Mean Filter (to eliminate local noise)
-                    filtered_image = cv2.medianBlur(filtered_image, 5)
-                    # Apply Grayscale filter
-                    filtered_image = cv2.cvtColor(filtered_image, cv2.COLOR_BGR2GRAY)  # create and app greyscale fil
-                    # Define Array of Reference Images for the Image to be calibrated
-                    ref_img = BitMap(filtered_image).bitmaps(images_with_references[img].__len__())
-                    k = 0
-                    while k < images_with_references[img].__len__():
-                        img_index = images_with_references[img][k].ImageIndex
-                        ref_filtered_image = img_to_process[img_index].clone(
-                            Rectangle(0, 0, img_to_process[img_index].Width,
-                                      img_to_process[img_index].Height))  # bitmap type
-                        # Apply median filter
-                        ref_filtered_image = cv2.medianBlur(ref_filtered_image, 5)
-                        # Apply Grayscale filter
-                        ref_filtered_image = cv2.cvtColor(ref_filtered_image, cv2.COLOR_BGR2GRAY)
-                        ref_img[k] = ref_filtered_image
-                        k = k + 1
-                    num_targets = store_trg_areas[img].__len__()
-                    if num_targets > 0:
-                        j = 0
-                        while j < num_targets:
-                            # Array size
-                            m = store_trg_areas[img][j].Width
-                            n = store_trg_areas[img][j].Height
-                            concentration_array = np.zeros(shape=(m, n))  # list of m x n float type
-                            # Target area square/rectangle dimension
-                            xi = store_trg_areas[img][j].X
-                            xf = xi + store_trg_areas[img][j].Width - 1
-                            yi = store_trg_areas[img][j].Y
-                            yf = yi + store_trg_areas[img][j].Height - 1
-                            xc = xi
-                            while xc <= xf:
-                                yc = yi
-                                while yc <= yf:
-                                    # Perform a linear regression for each pixel
-                                    # [i,0]->Intensity [i,1]->concentration
-                                    array = np.zeros(shape=(images_with_references[img].__len__, 2))
-                                    # Define array to perform linear regression
-                                    k = 0
-                                    while k < images_with_references[img].__len__():
-                                        array[k][0] = BitMap(ref_img[k]).pixel(xc, yc, layer='R')
-                                        array[k][1] = images_with_references[img][k].Concentration / 100.0
-                                        k = k + 1
-                                    # Linear Regression
-                                    # c_mean and Mean Intensity
-                                    c_mean = 0.0
-                                    i_mean = 0.0
-                                    kk = images_with_references[img].__len__()
-                                    k = 0
-                                    while k < kk:
-                                        c_mean = c_mean + array[k][1]
-                                        i_mean = i_mean + array[k][0]
-                                        k = k + 1
-                                    c_mean = c_mean / (kk * 1.0)
-                                    i_mean = i_mean / (kk * 1.0)
-                                    #  Calculate sc, si, r
-                                    sc = 0.0
-                                    si = 0.0
-                                    r = 0.0
-                                    k = 0
-                                    while k < kk:
-                                        sc = sc + ((array[k][1] - c_mean) ** 2)
-                                        si = si + ((array[k][0] - i_mean) ** 2)
-                                        r = r + (array[k][1] - c_mean) * (array[k][0] - i_mean)
-                                        k = k + 1
-                                    if si == 0 or sc == 0:
-                                        con_c = c_mean
-                                    else:
-                                        r = r / ((sc * si) ** 0.5)
-                                        sc = ((sc / (kk - 1)) ** 0.5)
-                                        si = ((si / (kk - 1)) ** 0.5)
-                                        b = r * sc / (si * 1.0)
-                                        a = c_mean - b * i_mean * 1.0
-                                        intensity = filtered_image.pixel(xc, yc, 'R')
-                                        con_c = b * intensity + a
-                                    x = (xc - xi)
-                                    y = (yc - yi)
-                                    concentration_array[x][y] = con_c
-                                    yc = yc + 1
-                                xc = xc + 1
-                            store_concentration_data[img] = concentration_array  # Stores Concentration Array
-                            j = j + 1
-                img = img + 1
-        # endregion
-        # region SIMPLE Calibration
-        # Different Image Size or Different Target Sizes (SIMPLE CALIBRATION)
-        if not cond1:
-            img = 0
-            while img < img_to_process.__len__():
-                if images_with_references[img].__len__() > 0:
-                    # Image filtration
-                    filtered_image = img_to_process[img].clone(
-                        Rectangle(0, 0, img_to_process[img].Width, img_to_process[img].Height))
-                    # Apply Mean Filter (to eliminate local noise)
-                    filtered_image = cv2.medianBlur(filtered_image, 5)
-                    # Apply Grayscale filter
-                    filtered_image = cv2.cvtColor(filtered_image, cv2.COLOR_BGR2GRAY)
-                    num_targets = store_trg_areas[img].__len__()
-                    if num_targets > 0:
-                        j = 0
-                        while j < num_targets:
-                            # Array size
-                            m = store_trg_areas[img][j].Width
-                            n = store_trg_areas[img][j].Height
-                            concentration_array = np.zeros(shape=(m, n))
-                            # Target area square/rectangle dimension
-                            xi = store_trg_areas[img][j].X
-                            xf = xi + store_trg_areas[img][j].Width - 1
-                            yi = store_trg_areas[img][j].Y
-                            yf = yi + store_trg_areas[img][j].Height - 1
-                            # PERFORM LINEAR REGRESSION FOR EACH TARGET
-                            # [i,0]->Intensity [i,1]->concentration
-                            array = np.zeros(shape=(images_with_references[img].__len__(), 2))  # array count x 2
-                            # Define array to perform linear regression
-                            k = 0
-                            while k < images_with_references[img].__len__():
-                                array[k][0] = get_mean_intensity_value(images_with_references[img][k].ImageIndex, j,
-                                                                       img_to_process, store_trg_areas)
-                                array[k][1] = images_with_references[img][k].Concentration / 100.0
-                                k = k + 1
-                            # Linear Regression
-                            # c_mean and Mean Intensity
-                            c_mean = 0.0
-                            i_mean = 0.0
-                            kk = images_with_references[img].__len__()
-                            k = 0
-                            while k < kk:
-                                c_mean = c_mean + array[k][1]
-                                i_mean = i_mean + array[k][0]
-                                k = k + 1
-                            c_mean = c_mean / (kk * 1.0)
-                            i_mean = i_mean / (kk * 1.0)
-                            #  Calculate sc, si, r
-                            sc = 0.0
-                            si = 0.0
-                            r = 0.0
-                            k = 0
-                            while k < kk:
-                                sc = sc + ((array[k][1] - c_mean) ** 2)
-                                si = si + ((array[k][0] - i_mean) ** 2)
-                                r = r + (array[k][1] - c_mean) * (array[k][0] - i_mean)
-                                k = k + 1
-                            r = r / ((sc * si) ** 0.5)
-                            sc = ((sc / (kk - 1)) ** 0.5)
-                            si = ((si / (kk - 1)) ** 0.5)
-                            b = r * sc / si
-                            a = c_mean - b * i_mean
-                            xc = xi
-                            while xc <= xf:
-                                yc = yi
-                                while yc <= yf:
-                                    intensity = filtered_image.pixel(xc, yc, 'R')
-                                    if sc == 0 or si == 0:
-                                        con_c = c_mean
-                                    else:
-                                        con_c = b * intensity + a
-                                    x = (xc - xi)
-                                    y = (yc - yi)
-                                    concentration_array[x][y] = con_c
-                                    yc = yc + 1
-                                xc = xc + 1
-                            store_concentration_data[img][j] = concentration_array  # Stores Concentration Array
-                            j = j + 1
-                img = img + 1
-        # endregion
+        filtered_cache = {}  # type: Dict[int, np.ndarray]
 
-    # region Without Calibration performed
-    #  Calculate Concentrations by performing a normalization of data
-    if not cal_performed:
-        '''/*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-        DEFINE CONCENTRATION ARRAYS FOR EACH TARGET DEFINED BY PERFORMING A NORMALIZATION OF THE DATA
-        Inputs:
-        ∙ target_area and img_to_process
-        ∙ Image loaded
+        def filtered(index):
+            if index not in filtered_cache:
+                filtered_cache[index] = filter_image(img_to_process[index]).Img.astype(np.float64)
+            return filtered_cache[index]
 
-        Output:
-        ∙ Concentration arrays
-        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*/'''
-        print('not calibration')
-        i = 0
-        while i < img_to_process.__len__():
-            # Image filtration
-            index = i
-            filtered_image = filter_image(img_to_process[index])
-            i_max_min = get_intensity_max_min(filtered_image)  # point structure
-            i_max = i_max_min.X
-            i_min = i_max_min.Y
-            num_targets = store_trg_areas[i].__len__()
-            if num_targets > 0:
-                j = 0
-                while j < num_targets:
-                    # Array size
-                    m = store_trg_areas[index][j].Width
-                    n = store_trg_areas[index][j].Height
-                    concentration_array = np.zeros(shape=(m, n))
-                    # Target area square/rectangle dimension---------------------------------------------------------
-                    xi = store_trg_areas[index][j].X
-                    xf = xi + store_trg_areas[index][j].Width - 1
-                    yi = store_trg_areas[index][j].Y
-                    yf = yi + store_trg_areas[index][j].Height - 1
-                    xc = xi
-                    while xc <= xf:
-                        yc = yi
-                        while yc <= yf:
-                            x = (xc - xi)
-                            y = (yc - yi)
-                            # Gets Intensity value of the grayscale Image
-                            intensity = filtered_image.pixel(xc, yc, 'R')
-                            con_c = (intensity - i_min) / ((i_max - i_min) * 1.0)
-                            if dark_checkbox:
-                                con_c = 1 - con_c  # Dark Areas Higher concentration
-                            concentration_array[x][y] = con_c
-                            yc = yc + 1
-                        xc = xc + 1
-                    store_concentration_data[index][j] = concentration_array  # Stores Concentration Array
-                    j = j + 1
-            i = i + 1
-    return store_concentration_data
-    # endregion
-    # Defines store_concentration_data[image_index][Target number]=Concentration array
+        same_sizes = _same_sizes_for_calibration(img_to_process, store_trg_areas, images_with_references)
+        for img in range(n_img):
+            refs = images_with_references[img]
+            if len(refs) == 0:
+                continue
+            kk = len(refs)
+            c = np.array([ref.Concentration / 100.0 for ref in refs], dtype=np.float64)
+            c_mean = float(np.sum(c)) / kk
+            sc = float(np.sum((c - c_mean) ** 2))
+            assessed = filtered(img)
+            for j, rect in enumerate(store_trg_areas[img]):
+                intensity = _crop(assessed, rect)
+                if same_sizes:
+                    # COMPLEX calibration: one linear regression per pixel.
+                    stack = np.stack([_crop(filtered(ref.ImageIndex), rect) for ref in refs])  # (kk, rows, cols)
+                    i_mean = np.sum(stack, axis=0) / kk
+                    dev = stack - i_mean
+                    si = np.sum(dev ** 2, axis=0)
+                    r = np.sum((c - c_mean)[:, None, None] * dev, axis=0)
+                    con = np.full(intensity.shape, c_mean, dtype=np.float64)
+                    ok = (si != 0) & (sc != 0)
+                    if np.any(ok):
+                        r_ok = r[ok] / np.sqrt(sc * si[ok])
+                        b = r_ok * math.sqrt(sc / (kk - 1)) / np.sqrt(si[ok] / (kk - 1))
+                        a = c_mean - b * i_mean[ok]
+                        con[ok] = b * intensity[ok] + a
+                else:
+                    # SIMPLE calibration: one regression per target on the mean intensity of the references.
+                    means = []
+                    for ref in refs:
+                        if j >= len(store_trg_areas[ref.ImageIndex]):
+                            raise ValueError('Reference image %d has no target %d; every reference needs the same '
+                                             'number of targets as the image it calibrates' % (ref.ImageIndex, j))
+                        means.append(get_mean_intensity_value(ref.ImageIndex, j, img_to_process, store_trg_areas))
+                    means = np.array(means, dtype=np.float64)
+                    i_mean = float(np.sum(means)) / kk
+                    si = float(np.sum((means - i_mean) ** 2))
+                    r = float(np.sum((c - c_mean) * (means - i_mean)))
+                    if sc == 0 or si == 0:
+                        con = np.full(intensity.shape, c_mean, dtype=np.float64)
+                    else:
+                        r = r / math.sqrt(sc * si)
+                        b = r * math.sqrt(sc / (kk - 1)) / math.sqrt(si / (kk - 1))
+                        a = c_mean - b * i_mean
+                        con = b * intensity + a
+                result[img].append(np.ascontiguousarray(con.T))
+    else:
+        # Without calibration: normalisation of the gray intensities of each image.
+        for i in range(n_img):
+            filtered_image = filter_image(img_to_process[i])
+            i_max_min = get_intensity_max_min(filtered_image)
+            i_max = float(i_max_min.X)
+            i_min = float(i_max_min.Y)
+            if i_max == i_min:
+                raise ValueError('Image %d (%s) has a uniform intensity (%g); it cannot be normalised'
+                                 % (i, loaded_image_info[i], i_max))
+            gray = filtered_image.Img.astype(np.float64)
+            for rect in store_trg_areas[i]:
+                con = (_crop(gray, rect) - i_min) / ((i_max - i_min) * 1.0)
+                if dark_checkbox:
+                    con = 1 - con  # dark areas carry the higher concentration
+                result[i].append(np.ascontiguousarray(con.T))
+    return result
 
 
 '''/*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -1003,49 +968,35 @@ REDUCTION IN THE SEGREGATION OF CONCENTRATION
 
 def segregation_intensity_index_factors(intensity_measures, img_to_process, store_con_data):
     """
-    CALCULATION OF SEGREGATION INTENSITY INDEX MEASURES
-    Inputs: 
-    ∙ Concentration matrix (Normalized or Calibrated intensity values)
+    CALCULATION OF SEGREGATION INTENSITY INDEX MEASURES (concentration data)
 
-    Output: 
-    ∙ Segregation Intensity Index factors = [σ, cov, m, ...] =
-      [St. dev., Cof. of Variance, Mixing Index, ...]
-    ∙ Other Target factors = [...,cm, c_max, c_min, n]
-      [..., Mean Concentration, Max. Con. Value found, Min. Con. Value found, Number of measured points]
+    Output: ``intensity_measures[image][target] = [σ, CoV, M, Cm, Cmax, Cmin, n]``
+    (standard deviation, coefficient of variation, mixing index ``1 - CoV``, mean concentration,
+    maximum and minimum concentration, number of pixels). ``intensity_measures`` (first argument) is
+    ignored and kept for compatibility.
 
     Hector Betancourt Cervantes, 2017
     """
-    # Define the  intensity_measures List
-    if intensity_measures.__len__() > 0:
-        intensity_measures = []
-    i = 0
-    while i < img_to_process.__len__():
-        intensity_measures.append([[]])
-        i = i + 1
-    j = 0
-    for List1 in store_con_data:
-        if List1.__len__() > 0:
-            i = 0
-            for item in List1:  # type: list
-                # Get mean and standard deviation of the previous matrix
-                stat_measure = statistical_measures(item)
-                cm = stat_measure[0] * 1.0
-                st_dev = stat_measure[1] * 1.0
-                cov = 0.0
-                m = 1.0
-                if st_dev > 0:
-                    cov = st_dev / cm
-                    m = 1 - cov
-                c_max = stat_measure[3] * 1.0
-                c_min = stat_measure[2] * 1.0
-                n = stat_measure[4] * 1.0
-                int_measures = [st_dev, cov, m, cm, c_max, c_min, n]
-                intensity_measures[j][i] = int_measures
-                i = i + 1
-        j = j + 1
-    return intensity_measures
-    # NormalizeCoV()
-    # Defines intensity_measures[image_index][Target number]={σ, cov, m, cm, c_max, c_min, n}
+    result = []
+    for i in range(len(img_to_process)):
+        result.append([])
+        if i >= len(store_con_data):
+            continue
+        for j, item in enumerate(store_con_data[i]):
+            stat_measure = statistical_measures(item)
+            cm = stat_measure[0] * 1.0
+            st_dev = stat_measure[1] * 1.0
+            cov = 0.0
+            m = 1.0
+            if st_dev > 0:
+                if cm == 0:
+                    raise ValueError('Image %d, target %d: the mean concentration is zero, the coefficient of '
+                                     'variation is undefined' % (i, j))
+                cov = st_dev / cm
+                m = 1 - cov
+            result[i].append([st_dev, cov, m, cm, stat_measure[3] * 1.0, stat_measure[2] * 1.0,
+                              stat_measure[4] * 1.0])
+    return result
 
 
 '''/*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -1053,159 +1004,82 @@ REDUCTION IN THE SCALE OF CONCENTRATION
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*/'''
 
 
+def _variogram(standard_data, axis):
+    """γ(h) = Σ (z(s) - z(s+h))² / (2 N(h)) for h = 0 .. floor(length/2) along ``axis``."""
+    data = np.ascontiguousarray(standard_data if axis == 0 else standard_data.T, dtype=np.float64)
+    length, other = data.shape
+    max_h = int(math.floor(length / 2.0))
+    variogram = np.zeros(max_h + 1)
+    for dist in range(1, max_h + 1):
+        diff = data[dist:, :] - data[:-dist, :]
+        nh = (length - dist) * other
+        variogram[dist] = float(np.einsum('ij,ij->', diff, diff)) / (2 * nh)
+    return variogram
+
+
 def horizontal_var_diagram(hor_var_diagrams, store_con_data, img_to_process, intensity_measures):
     """
-    HORIZONTAL VARIOGRAM CALCULATION
-    Inputs:
-    ∙ Standarized concentration matrix
-
-    Output:
-    ∙ Variogram array: γx(h)=variogram[h]
-
-    Computing method proposed by Alena Kukukova, 2010
+    HORIZONTAL VARIOGRAM (Kukukova, 2010) of the standardised concentration matrix, along the image width
+    (axis 0 of the ``[x][y]`` arrays). ``hor_var_diagrams`` is ignored (compatibility).
+    Output: ``[image][target]`` -> numpy array ``γx(h)``, ``h = 0 .. Width // 2``.
     """
-    # Define Horizontal_Var_diagrams List
-    if hor_var_diagrams.__len__() > 0:
-        hor_var_diagrams = []
-    k = 0
-    while k < img_to_process.__len__():
-        hor_var_diagrams.append([[]])
-        k = k + 1
-    i = 0
-    for List1 in store_con_data:
-        if List1.__len__() > 0:
-            for j in range(List1.__len__()):
-                # Variables
-                # Get standarized concentration matrix
-                standard_data = standarized_array(i, j, store_con_data, intensity_measures)
-                print("standard data size")
-                print(standard_data.shape)
-                #  Maximum separation distance is one half of the target area
-                # max_h = total # of separation distances to evaluate
-                max_h = int(math.floor(standard_data.shape[0] / 2.0))
-                # Define Horizontal Var diagram array
-                h_var_diagram = np.zeros(max_h + 1)  # array float
-                h_var_diagram[0] = 0
-                #  loop through all separation distances  for zero dist, var is 0, so we don't need to calculate
-                dist = 1
-                while dist <= max_h:
-                    sum2 = 0
-                    nh = 0
-                    # Loop through all rows (y-direction)
-                    y = 0
-                    while y < standard_data.shape[1]:
-                        # for each row, loop through columns (x-direction)
-                        x = 0
-                        while x < standard_data.shape[0] - dist:
-                            sum2 = sum2 + (standard_data[x][y] - standard_data[(x + dist)][y] ** 2)
-                            nh = nh + 1
-                            x = x + 1
-                        y = y + 1
-                    h_var_diagram[dist] = sum2 / (2 * nh)  # Var diagram calculation from equation
-                    dist = dist + 1
-                # noinspection PyTypeChecker
-                hor_var_diagrams[i][j] = h_var_diagram
-                print("h var diagram size")
-                print(h_var_diagram.size)
-        i = i + 1
-    return hor_var_diagrams
-    # Defines Horizontal_Var_diagrams[image_index][Target number] = Horizontal Var diagram
+    result = []
+    for i in range(len(img_to_process)):
+        result.append([])
+        if i >= len(store_con_data):
+            continue
+        for j in range(len(store_con_data[i])):
+            result[i].append(_variogram(standarized_array(i, j, store_con_data, intensity_measures), axis=0))
+    return result
 
 
 def vertical_var_diagram(ver_var_diagrams, img_to_process, store_con_data, intensity_measures):
     """
-    VERTICAL VARIOGRAM CALCULATION
-    Inputs:
-    ∙ target_area
-    ∙ Standarized concentration matrix
-
-    Output:
-    ∙ Variogram array: γx(h)=variogram[h]
-
-    Computing method proposed by Alena Kukukova, 2010
+    VERTICAL VARIOGRAM (Kukukova, 2010) of the standardised concentration matrix, along the image height
+    (axis 1 of the ``[x][y]`` arrays). ``ver_var_diagrams`` is ignored (compatibility).
+    Output: ``[image][target]`` -> numpy array ``γy(h)``, ``h = 0 .. Height // 2``.
     """
-    # Define Horizontal_Var_diagrams List
-    if ver_var_diagrams.__len__() > 0:
-        ver_var_diagrams = []
-    k = 0
-    while k < img_to_process.__len__():
-        ver_var_diagrams.append([[]])
-        k = k + 1
-    i = 0
-    for List1 in store_con_data:
-        if List1.__len__() > 0:
-            for j in range(List1.__len__()):
-                # Get standarized concentration matrix
-                std_data = standarized_array(i, j, store_con_data, intensity_measures)
-                # Variables
-                #  Maximum separation distance is one half of the target area
-                # max_h = total # of separation distances to evaluate
-                max_h = int(math.floor(std_data.shape[1] / 2.0))
-                # Define Horizontal Variogram array
-                v_var_diagram = np.zeros(max_h + 1)
-                v_var_diagram[0] = 0
-                #  loop through all separation distances  for zero dist, var is 0, so we don't need to calculate
-                dist = 1
-                while dist <= max_h:
-                    sum2 = 0
-                    nh = 0
-                    # Loop through all rows (y-direction)
-                    x = 0
-                    while x < std_data.shape[0]:
-                        # for each row, loop through columns (x-direction)
-                        y = 0
-                        while y < std_data.shape[1] - dist:
-                            sum2 = sum2 + (std_data[x][y] - std_data[x][(y + dist)] ** 2)
-                            nh = nh + 1
-                            y = y + 1
-                        x = x + 1
-                    v_var_diagram[dist] = sum2 / (2 * nh)  # Variogram calculation from equation
-                    dist = dist + 1
-                # noinspection PyTypeChecker
-                ver_var_diagrams[i][j] = v_var_diagram
-        i = i + 1
-    return ver_var_diagrams
-    # Defines Vertical_Var_diagrams[image_index][Target number] = Vertical Variogram
+    result = []
+    for i in range(len(img_to_process)):
+        result.append([])
+        if i >= len(store_con_data):
+            continue
+        for j in range(len(store_con_data[i])):
+            result[i].append(_variogram(standarized_array(i, j, store_con_data, intensity_measures), axis=1))
+    return result
 
 
 def mean_length_scales(img_to_process, store_concentration_data, intensity_measures, hor_var_diagrams,
                        ver_var_diagrams):
     """
-    MEAN LENGTH SCALE CALCULATION
-    Inputs:
-    ∙ target_area
-    ∙ Horizontal or vertical variogram vector
-
-
-    Output:
-    ∙ Mean length scale: Lv = p∙[δγx/δh]^(-1)
-        Horizontal(1) or Vertical(2) mean length scale
-
-    Computing method proposed by Alena Kukukova, 2010
+    MEAN LENGTH SCALE (Kukukova, 2010): ``L = p / (dγ/dh at h=0)`` with ``p`` the mean concentration
+    and the slope taken as ``γ(1) - γ(0)``. Output: ``[image][target]`` -> ``Coordinate(X=horizontal,
+    Y=vertical)`` in pixels.
     """
-    # Define mean_len_scales List
-    mean_len_scales = []
-    k = 0
-    while k < img_to_process.__len__():
-        mean_len_scales.append([[]])
-        k = k + 1
-    i = 0
-    for List1 in store_concentration_data:
-        if List1.__len__() > 0:
-            for j in range(List1.__len__()):
-                # Read standarized intensity array from the requested target
-                lms = Coordinate(0, 0)  # structure coordinate
-                p = intensity_measures[i][j][3]  # The proportion of the minor species in the sample region = C_mean
-                # Horizontal(1) or Vertical(2) mean length scale calculation
-                #  Units:pixels/concentration^2
-                lms.X = p * (1 / (hor_var_diagrams[i][j][1] - hor_var_diagrams[i][j][0]))
-                #  Units:pixels/concentration^2
-                lms.Y = p * (1 / (ver_var_diagrams[i][j][1] - ver_var_diagrams[i][j][0]))
-                # noinspection PyTypeChecker
-                mean_len_scales[i][j] = lms
-        i = i + 1
-    return mean_len_scales
-    # Defines mean_len_scales[image_index][Target number].X = Hor_mean_length_scale  .Y = Ver_mean_length_scale
+    result = []
+    for i in range(len(img_to_process)):
+        result.append([])
+        if i >= len(store_concentration_data):
+            continue
+        for j in range(len(store_concentration_data[i])):
+            p = intensity_measures[i][j][3]
+            hor, ver = hor_var_diagrams[i][j], ver_var_diagrams[i][j]
+            if len(hor) < 2 or len(ver) < 2:
+                raise ValueError('Image %d, target %d: the target is too small for a variogram (needs at least '
+                                 '2 x 2 pixels)' % (i, j))
+            scales = []
+            for name, variogram in (('horizontal', hor), ('vertical', ver)):
+                slope = variogram[1] - variogram[0]
+                if slope == 0:
+                    # No variation along this direction (for example perfect stripes): the length scale is
+                    # unbounded, as the C# double division gives Infinity.
+                    warnings.warn('Image %d, target %d: the %s variogram slope at h=1 is zero, the %s mean '
+                                  'length scale is infinite' % (i, j, name, name))
+                    scales.append(math.inf if p >= 0 else -math.inf)
+                else:
+                    scales.append(p * (1 / slope))
+            result[i].append(Coordinate(scales[0], scales[1]))
+    return result
 
 
 '''/*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -1215,398 +1089,150 @@ RATE OF CHANGE IN SEGREGATION
 
 def calculate_exposure_indexes(img_to_process, store_concentration_data):
     """
-    HORIZONTAL VARIOGRAM CALCULATION
-    Inputs:
-    ∙ Concentration matrix
-
-    Output:
-    ∙ Exposure: Ε≅∑∑〖(1/2)⋅K⋅a(i,j)⋅(Ci-Cj) 〗
-
-    Computing method proposed by Alena Kukukova, 2009
+    EXPOSURE (Kukukova, 2009): ``E = Σ Σ ½ |Ci - Cj|`` over the 4-neighbours of every pixel, which equals
+    the sum of the absolute concentration differences between every pair of adjacent pixels.
+    Output: ``[image][target]`` -> float.
     """
-    # Define exposure_indexes List
-    exposure_indexes = []
-    k = 0
-    while k < img_to_process.__len__():
-        exposure_indexes.append([])
-        k = k + 1
-    i = 0
-    for List1 in store_concentration_data:
-        if List1.__len__() > 0:
-            for j in range(List1.__len__()):
-                # Get Concentration Array
-                data = store_concentration_data[i][j]
-                # Define Variables
-                exp = 0
-                xf = np.array(data).shape[0]
-                yf = np.array(data).shape[1]
-                # Calculate Exposure
-                x = 0
-                while x < xf:
-                    y = 0
-                    while y < yf:
-                        if x != 0:
-                            exp = exp + 0.5 * abs(data[x][y] - data[x - 1][y])
-                        if y != 0:
-                            exp = exp + 0.5 * abs(data[x][y] - data[x][y - 1])
-                        if x != xf - 1:
-                            exp = exp + 0.5 * abs(data[x][y] - data[x + 1][y])
-                        if y != yf - 1:
-                            exp = exp + 0.5 * abs(data[x][y] - data[x][y + 1])
-                        y = y + 1
-                    x = x + 1
-                exposure_indexes[i] = exp
-        i = i + 1
-    return exposure_indexes
-    # Defines exposure_indexes[image_index][Target number] = Exposure
+    result = []
+    for i in range(len(img_to_process)):
+        result.append([])
+        if i >= len(store_concentration_data):
+            continue
+        for data in store_concentration_data[i]:
+            data = np.asarray(data, dtype=np.float64)
+            exp = float(np.sum(np.abs(np.diff(data, axis=0)))) + float(np.sum(np.abs(np.diff(data, axis=1))))
+            result[i].append(exp)
+    return result
 
 
 # endregion
-# region Auxiliar functions and Intensity Information Arrays
+# region Auxiliary functions and intensity information arrays
 
 
 def filter_image(img_ori):
-    """
-    :rtype: bitmap
-    :param img_ori: bitmap image
-    """
+    """Median filter (5x5) followed by grayscale conversion; returns a ``BitMap``."""
     filtered_image = img_ori.clone(Rectangle(0, 0, img_ori.Width, img_ori.Height))
-    # Apply Mean Filter (to eliminate local noise)
-    filtered_image = cv2.medianBlur(filtered_image, 5)
-    # Apply Grayscale filter
-    filtered_image = cv2.cvtColor(filtered_image, cv2.COLOR_BGR2GRAY)
-    # Apply Histogram remapping
-    # filtered_image = new HistogramEqualization().Apply(filtered_image)
+    filtered_image = cv2.medianBlur(np.ascontiguousarray(filtered_image), 5)
+    if filtered_image.ndim == 3:
+        filtered_image = cv2.cvtColor(filtered_image, cv2.COLOR_BGR2GRAY)
     return BitMap(filtered_image)
 
 
 def get_mean_intensity_value(img_index, target, img_to_process, store_target_areas):
-    """
-    :param store_target_areas: target areas of each image
-    :param img_to_process: images to process
-    :rtype: float
-    :param img_index: 
-    :param target:
-    """
-    tgt_mean = 0.0
-    ref_filtered_image = img_to_process[img_index].clone(
-        Rectangle(0, 0, img_to_process[img_index].Width, img_to_process[img_index].Height))
-    # Apply median filter
-    ref_filtered_image = cv2.medianBlur(ref_filtered_image, 5)
-    # Apply Grayscale filter
-    ref_filtered_image = cv2.cvtColor(ref_filtered_image, cv2.COLOR_BGR2GRAY)
-    # Array size
-    # ConcentrationArray = np.zeros(shape=(m, n))
-    # Target area square/rectangle dimension
-    xi = store_target_areas[img_index][target].X
-    xf = xi + store_target_areas[img_index][target].Width - 1
-    yi = store_target_areas[img_index][target].Y
-    yf = yi + store_target_areas[img_index][target].Height - 1
-    nn = 0.0
-    xc = xi
-    while xc <= xf:
-        yc = yi
-        while yc <= yf:
-            tgt_mean = tgt_mean + BitMap(ref_filtered_image).pixel(xc, yc, layer='R')
-            nn = nn + 1
-            yc = yc + 1
-        xc = xc + 1
-    tgt_mean = tgt_mean / (nn * 1.0)
-    return tgt_mean
-    # Get Mean Intensity value in a target of a REFERENCE IMAGE
+    """Mean gray intensity of a target of a (reference) image after ``filter_image``."""
+    rect = store_target_areas[img_index][target]
+    filtered = filter_image(img_to_process[img_index])
+    return float(np.mean(filtered.clone(rect).astype(np.float64)))
 
 
 def get_intensity_max_min(filtered_image):
-    """
-
-    :rtype: float point
-    :param filtered_image: bitmap file
-    """
-    intensity_max_and_min = Point(0.0, 0.0)
-    intensity_max_and_min.X = 0  # I_max
-    intensity_max_and_min.Y = 255  # I_min
-    # Target area square/rectangle dimension
-    xf = filtered_image.Width
-    yf = filtered_image.Height
-    # Define intensity array in "IntensityArrayData
-    x = 0
-    while x < xf:
-        y = 0
-        while y < yf:
-            pix_val = filtered_image.pixel(x, y, 'R')
-            if pix_val > intensity_max_and_min.X:
-                intensity_max_and_min.X = pix_val
-            if pix_val < intensity_max_and_min.Y:
-                intensity_max_and_min.Y = pix_val
-            y = y + 1
-        x = x + 1
-    return intensity_max_and_min
+    """``Point(X=max, Y=min)`` gray intensity of a filtered image (bounded to 0..255 like the original)."""
+    data = filtered_image.Img
+    return Point(max(0, data.max()), min(255, data.min()))
 
 
 def statistical_measures(data):
-    # type: (list) -> list
     """
-    COMPUTE STATISTICAL MEASURES
-    Inputs:
-    ∙ Array
-
-    StatisticalArray=[μ,σ,x_min,x_max,n]=[Mean, Std. Dev., Min Value, Max Value, Number of Data] = [0,1,2,3,4]
-
-    Output:
-    ∙ Statistical measures array
-    :return: stat_measures
-    :rtype: list
-    :param data: array
+    ``[μ, σ, x_min, x_max, n]`` of an array: mean, population standard deviation, minimum, maximum
+    (never below 0, as in the original) and number of values.
     """
-    # Define variables
-    mean = 0.0
-    st_dev = 0.0
-    x_max = 0.0
-    if data.shape.__len__() == 1:
-        data = data.reshape((data.__len__(), 1))
-    x_min = data[0][0]
-    n = 0.0
-    stat_measures = [0.0, 0.0, 0.0, 0.0, 0.0]
-    # Find Mean, n, x_max & x_min
-    xc = 0
-    while xc < np.array(data).shape[0]:
-        yc = 0
-        while yc < np.array(data).shape[1]:
-            if x_max < data[xc][yc]:
-                x_max = data[xc][yc]
-            if x_min > data[xc][yc]:
-                x_min = data[xc][yc]
-            mean = mean + data[xc][yc]
-            n = n + 1
-            yc = yc + 1
-        xc = xc + 1
-    mean = mean / (n * 1.0)
-    # Compute Standard deviation
-    xc = 0
-    while xc < np.array(data).shape[0]:
-        yc = 0
-        while yc < np.array(data).shape[1]:
-            st_dev = st_dev + ((data[xc][yc] - mean) ** 2)
-            yc = yc + 1
-        xc = xc + 1
-    st_dev = ((st_dev / (n * 1.0)) ** 0.5)
-    stat_measures[0] = mean
-    stat_measures[1] = st_dev
-    stat_measures[2] = x_min
-    stat_measures[3] = x_max
-    stat_measures[4] = n
-    return stat_measures
+    data = np.asarray(data, dtype=np.float64)
+    if data.ndim == 1:
+        data = data.reshape((len(data), 1))
+    if data.size == 0:
+        raise ValueError('cannot compute statistics of an empty array')
+    n = float(data.size)
+    mean = float(np.sum(data)) / n
+    st_dev = math.sqrt(float(np.sum((data - mean) ** 2)) / n)
+    return [mean, st_dev, float(data.min()), max(0.0, float(data.max())), n]
 
 
 def standarized_array(image_index, target, store_con_data, intensity_measures):
-    """
-    DEFINE STANDARIZED ARRAY
-    Inputs:
-    ∙ Array
-    ∙ Statistical measures: Mean (μ) and Standard deviation (σ)
-
-    Xsi=(xi-μ)/σ
-
-    Output:
-    ∙ Standarized array [0,1,2,3,4]
-    :param intensity_measures:
-    :param store_con_data:
-    :param image_index:
-    :param target:
-    """
-    # Declare normalized intensity array
-    # m = The number of rows in the concentration array -> data.shape[0)
-    # n = The number of columns in the concentration array -> data.shape[1)
-    m = int(np.array(store_con_data[image_index][target]).shape[0])
-    n = int(np.array(store_con_data[image_index][target]).shape[1])
-    standarized_data = np.zeros(shape=(m, n))
-    # Declare other variables
-    # Get Mean and standard deviation to standarize the array
+    """Standardised concentration array ``(x - μ) / σ`` of a target."""
+    data = np.asarray(store_con_data[image_index][target], dtype=np.float64)
     mean = intensity_measures[image_index][target][3]
     st_dev = intensity_measures[image_index][target][0]
-    # Define standarized intensity array
-    xc = 0
-    while xc < m:
-        yc = 0
-        while yc < n:
-            xi = store_con_data[image_index][target][xc][yc]
-            standarized_data[xc][yc] = (xi - mean) / st_dev
-            yc = yc + 1
-        xc = xc + 1
-    return standarized_data
-    # Function that returns normalized intensity array of a target area
+    if st_dev == 0:
+        raise ValueError('Image %d, target %d: the concentration is uniform (σ = 0), it cannot be standardised'
+                         % (image_index, target))
+    return (data - mean) / st_dev
 
 
 def get_intensity_array(image_index, target_area, img_to_process2, store_target_areas2):
-    """
-    get_intensity_array
-    DEFINE INTENSITY ARRAY
-    Inputs:
-    ∙ target_area and img_to_process
-    ∙ Image loaded
-
-    Output:
-    ∙ Intensity array
-    :param store_target_areas2: store areas to process from each image
-    :param img_to_process2: images to process
-    :param image_index:
-    :param target_area:
-    """
-    index = image_index
-    filtered_image = img_to_process2[index]
-    filtered_image = filter_image(filtered_image)
-    # Target area square/rectangle dimension
-    xi = store_target_areas2[index][target_area].X
-    xf = xi + store_target_areas2[index][target_area].Width - 1
-    yi = store_target_areas2[index][target_area].Y
-    yf = yi + store_target_areas2[index][target_area].Height - 1
-    # Array dimension
-    x = (xf - xi)
-    y = (yf - yi)
-    # Variables
-    intensity_array_data = np.zeros(shape=(x + 1, y + 1))  # Declare array of intensity values
-    # Define intensity array in "intensity_array_data[]"
-    xc = xi
-    while xc <= xf:
-        yc = yi
-        while yc <= yf:
-            x = (xc - xi)
-            y = (yc - yi)
-            # Gets Intensity value of the grayscale Image
-            intensity_array_data[x][y] = BitMap(filtered_image).pixel(xc, yc, layer='R')
-            yc = yc + 1
-        xc = xc + 1
-    return intensity_array_data
-    # Function that returns the intensity array of a target area
+    """Gray intensity array of a target after ``filter_image``, indexed ``[x][y]`` (shape ``(Width, Height)``)."""
+    filtered = filter_image(img_to_process2[image_index])
+    rect = store_target_areas2[image_index][target_area]
+    return np.ascontiguousarray(filtered.clone(rect).astype(np.float64).T)
 
 
 def full_image_data_array(image_index, img_to_process2):
+    """Gray intensity array of the whole image after ``filter_image``, indexed ``[x][y]``."""
+    filtered = filter_image(img_to_process2[image_index])
+    return np.ascontiguousarray(filtered.Img.astype(np.float64).T)
+
+
+# endregion
+# region High-level helpers (CLI / GUI)
+
+
+def run_particle_analysis(image_bgr, targets, threshold_value=50, color='red', detector=None, out_dir=None,
+                          show=False, verbose=False, horizontal=True, collect_stages=False):
     """
-    DEFINE INTENSITY ARRAY
-    Inputs:
-    ∙ Image loaded
+    Full particle-data pipeline for one image and a list of ``Rectangle`` targets.
 
-    Output:
-    ∙ Full image intensity array
-    :param img_to_process2:
-    :param image_index:
+    :return: the dictionary of ``mixing_dim_particle_data`` plus ``particle_positions``,
+             ``blob_rectangles``, ``mean_spacing``, ``transects`` and ``targets``; with
+             ``collect_stages`` also ``detection_stages`` (intermediate images per target).
     """
-    filtered_image = img_to_process2[image_index]
-    filtered_image = filter_image(filtered_image)
-    # Target area square/rectangle dimension
-    xf = filtered_image.Width
-    yf = filtered_image.Height
-    # Variables
-    image_intensity_array = np.zeros(shape=(xf, yf))  # Declare array of intensity values
-    # Define intensity array in "IntensityArrayData[]"
-    x = 0
-    while x < xf:
-        y = 0
-        while y < yf:
-            # Gets Intensity value of the grayscale Image
-            image_intensity_array[x][y] = BitMap(filtered_image).pixel(x, y, layer='R')
-            y = y + 1
-        x = x + 1
-    return image_intensity_array
-    # Function that returns the intensity array of the loaded image
+    img_to_process = [BitMap(image_bgr)]
+    store_target_areas = [list(targets)]
+    for rect in targets:
+        img_to_process[0].check_rectangle(rect)
+    stages_out = [] if collect_stages else None
+    positions, rectangles = blob_detection_image(img_to_process, threshold_value, store_target_areas, color=color,
+                                                 detector=detector, show=show, out_dir=out_dir, verbose=verbose,
+                                                 stages_out=stages_out)
+    for j, pts in enumerate(positions[0]):
+        if len(pts) < 4:
+            raise ValueError('Target %d (%r): only %d particles detected; at least 4 are needed. Try another '
+                             'threshold or colour.' % (j, targets[j], len(pts)))
+    mean_spacing, transects, max_striation = initiate_max_str_thickness(img_to_process, positions,
+                                                                        store_target_areas, horizontal)
+    results = mixing_dim_particle_data(store_target_areas, ['Img1'], positions, max_striation, verbose=verbose)
+    results.update({'particle_positions': positions, 'blob_rectangles': rectangles, 'mean_spacing': mean_spacing,
+                    'transects': transects, 'targets': store_target_areas})
+    if collect_stages:
+        results['detection_stages'] = stages_out
+    return results
 
 
-def blob_detection_image(img_to_process, threshold_value, store_target_areas):
-    store_blob_rectangles = []
-    store_part_pos = []  # type: List[List[Point]]
-    # Multiple object detection----------------------------------------------------------
-    # Filter by Area.
-    area_blob = [1, 50]
-    blob_counter = BlobDetector(threshold=[150, 255], flag_area=True, limit_area=area_blob, flag_circularity=False,
-                                min_cir=0.050, flag_convexity=False, convexity=[0.01, 1], flag_inertia=False,
-                                ratio_inertia=[0.00, 1], flag_color=False)
-    # Filter IMAGE---------------------------------------------------------------------
-    index = 0
-    for img in img_to_process:
-        assert isinstance(img, BitMap)
-        trg_ind = 0
-        # noinspection SpellCheckingInspection
-        for area in store_target_areas[index]:
-            # Store Rectangles and Particles positions
-            store_blob_rectangles.append([])
-            store_part_pos.append([])
-            filtered_img = img.clone(area)
-            original_img = img.clone(area)
-            # cv2.imshow('Image selected area', filtered_img)
-            # cv2.waitKey(0)
-            plt.imshow(filtered_img)
-            plt.show()
-            cv2.imwrite('0.jpg', filtered_img)
-            # It converts the BGR color space of image to HSV color space
-            hsv = cv2.cvtColor(filtered_img, cv2.COLOR_BGR2HSV)
-            # Threshold of blue in HSV space
-            lower_blue = np.array([85, 100, 100])
-            upper_blue = np.array([130, 255, 255])
-            lower_red = np.array([0, 100, 100])
-            upper_red = np.array([10, 255, 255])
-            lower_green = np.array([50, 100, 100])
-            upper_green = np.array([65, 255, 255])
-            lower_yellow = np.array([18, 100, 100])
-            upper_yellow = np.array([38, 255, 255])
-            # preparing the mask to overlay
-            # mask = cv2.inRange(hsv, lower_blue, upper_blue)
-            mask = cv2.inRange(hsv, lower_red, upper_red)
-            # cv2.imshow('mask of the image', mask)
-            # cv2.waitKey(0)
-            cv2.imwrite('1.jpg', mask)
-            # The black region in the mask has the value of 0,
-            # so when multiplied with original image removes all non-blue regions
-            aux = cv2.bitwise_and(filtered_img, filtered_img, mask=mask)
-            aux1 = cv2.cvtColor(aux, cv2.COLOR_HSV2RGB)
-            # cv2.imshow('Image filtered color', aux)
-            # cv2.waitKey(0)
-            plt.imshow(aux)
-            plt.show()
-            cv2.imwrite('2.jpg', aux)
-            filtered_img = aux1
-            # Grayscale filter
-            aux2 = cv2.cvtColor(aux, cv2.COLOR_BGR2GRAY)
-            # cv2.imshow('Image filtered gray', aux2)
-            # cv2.waitKey(0)
-            plt.imshow(aux2)
-            plt.show()
-            cv2.imwrite('3.jpg', aux2)
-            filtered_img = aux2
-            # ApplyThreshold
-            # Blue
-            # kernel = np.ones((3, 3), np.uint8)
-            # filtered_img = cv2.dilate(filtered_img, kernel, iterations=2)
-            # kernel = np.ones((6, 6), np.uint8)
-            # filtered_img = cv2.erode(filtered_img, kernel, iterations=2)
-            # green
-            kernel = np.ones((2, 2), np.uint8)
-            filtered_img = cv2.dilate(filtered_img, kernel, iterations=1)
-            kernel = np.ones((2, 2), np.uint8)
-            filtered_img = cv2.erode(filtered_img, kernel, iterations=1)
-            ret, filtered_img = cv2.threshold(filtered_img, threshold_value, 255, cv2.THRESH_BINARY_INV)
-            # cv2.imshow('Image filtered erode', filtered_img)
-            # cv2.waitKey(0)
-            plt.imshow(filtered_img)
-            plt.show()
-            cv2.imwrite('4.jpg', filtered_img)
-            # Perform Blob detection
-            key_points = blob_counter.detect_blobs(filtered_img)
-            rectangles = blob_counter.rectangles(key_points)
-            store_blob_rectangles[index] = rectangles
-            store_part_pos[index] = [[]]
-            for i in range(rectangles.__len__()):
-                part_coord = Point(int(key_points[i].pt[0]), int(key_points[i].pt[1]))
-                store_part_pos[index][trg_ind].append(part_coord)
-        index = index + 1
-    im_with_keypoints = cv2.drawKeypoints(original_img, key_points, np.array([]), (255, 255, 255),
-                                          cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-    for point in key_points:
-        im_with_keypoints2 = cv2.circle(original_img, (int(point.pt[0]), int(point.pt[1])), int(point.size),
-                                        (255, 255, 255), 4)
-    cv2.imshow('Image with ' + str(store_part_pos[0][0].__len__()) + ' blobs', im_with_keypoints2)
-    cv2.waitKey(0)
-    plt.imshow(im_with_keypoints2)
-    plt.show()
-    cv2.imwrite('5.jpg', im_with_keypoints2)
-    return store_part_pos, store_blob_rectangles
+def run_concentration_analysis(image_bgr, targets, dark_areas_higher=False, verbose=False):
+    """Full concentration-data pipeline (no calibration) for one image and a list of ``Rectangle`` targets."""
+    img_to_process = [BitMap(image_bgr)]
+    store_target_areas = [list(targets)]
+    results = mixing_dim_concentration_data(img_to_process, store_target_areas, None, [[RefImg(0, 1)]], ['Img1'],
+                                            dark_areas_higher, verbose=verbose)
+    results['targets'] = store_target_areas
+    return results
+
+
+def to_jsonable(obj):
+    """Recursively convert results (numpy arrays, Points, Rectangles, ...) into JSON-serialisable values."""
+    if isinstance(obj, dict):
+        return {str(k): to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_jsonable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, (Point, Coordinate)):
+        return {'X': to_jsonable(obj.X), 'Y': to_jsonable(obj.Y)}
+    if isinstance(obj, Rectangle):
+        return {'X': obj.X, 'Y': obj.Y, 'Width': obj.Width, 'Height': obj.Height}
+    if isinstance(obj, RefImg):
+        return {'ImageIndex': obj.ImageIndex, 'Concentration': obj.Concentration}
+    return obj
+
+
 # endregion

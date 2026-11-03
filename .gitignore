@@ -1,6 +1,9 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+miquod_output/
 .claude/
 CLAUDE.md
 CLAUDE.local.md
+app_example.png

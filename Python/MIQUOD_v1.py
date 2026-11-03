@@ -1,62 +1,183 @@
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""
+MIQUOD command-line interface.
+
+Quantify mixing from an image: particle data (blob detection, striation thickness, PNN scale of
+segregation) and/or concentration data (intensity of segregation, variograms, mean length scales,
+exposure). See docs/usage.md.
+
+Examples::
+
+    python MIQUOD_v1.py                                       # sample image, particle data
+    python MIQUOD_v1.py image.png --roi 24 82 2700 2120 --mode both
+    python MIQUOD_v1.py image.png --select-roi --mode concentration --dark
+    python MIQUOD_v1.py image.png --roi 0 0 500 500 --roi 600 0 500 500 --color blue --threshold 60 --show
+
+The ROI is ``X Y WIDTH HEIGHT`` with ``X`` the column and ``Y`` the row of the top-left corner, the
+same order that ``cv2.selectROI`` prints. Results are written to ``--out-dir`` (``results.json`` plus
+the intermediate images of the particle detection and the concentration arrays as ``.npy``).
+"""
 __author__ = 'Edisson Naula'
-__date__ = '$ 26/3/2020  at 18:00 $'
+__version__ = '2.1.0'
+
+import argparse
+import json
+import os
+import sys
+import time
 
 import cv2
+import numpy as np
+
 import Mixing_QMPD as Mf
-from typing import List
+
+# Windows consoles often default to cp1252, which cannot encode the Greek letters in the
+# result labels (σ, σ_fpp) and would make the prints raise UnicodeEncodeError.
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_IMAGE = os.path.join(SCRIPT_DIR, '3colors_unmixed.png')
+# Default target of the sample image (2752 x 2208 px): columns 24-2723, rows 82-2201.
+DEFAULT_ROI = (24, 82, 2700, 2120)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog='MIQUOD_v1.py',
+        description='MIQUOD %s: quantify mixing from an image.' % __version__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='examples:\n'
+               '  python MIQUOD_v1.py\n'
+               '  python MIQUOD_v1.py image.png --roi 24 82 2700 2120 --mode both\n'
+               '  python MIQUOD_v1.py image.png --select-roi --mode concentration --dark\n'
+               '  python MIQUOD_v1.py image.png --roi 0 0 500 500 --roi 600 0 500 500 --color blue --show\n')
+    parser.add_argument('image', nargs='?', default=DEFAULT_IMAGE,
+                        help='image to analyse (default: the sample 3colors_unmixed.png next to this script)')
+    parser.add_argument('--roi', action='append', nargs=4, type=int, metavar=('X', 'Y', 'WIDTH', 'HEIGHT'),
+                        help='target area, repeatable. X/Y are the column/row of the top-left corner. '
+                             'Default: the sample target for the sample image, otherwise the whole image')
+    parser.add_argument('--select-roi', action='store_true',
+                        help='draw the target(s) with the mouse (ENTER/SPACE confirms a rectangle, ESC finishes)')
+    parser.add_argument('--mode', choices=['particles', 'concentration', 'both'], default='particles',
+                        help='which measures to compute (default: particles)')
+    parser.add_argument('--threshold', type=int, default=50, metavar='0-255',
+                        help='gray threshold applied before blob detection (default: 50)')
+    parser.add_argument('--color', choices=sorted(Mf.COLOR_RANGES), default='red',
+                        help='dye colour of the particles (default: red)')
+    parser.add_argument('--dark', action='store_true',
+                        help='concentration data: dark areas carry the higher concentration')
+    parser.add_argument('--out-dir', default='miquod_output', metavar='DIR',
+                        help='where results.json, the intermediate images and the arrays are written '
+                             '(default: ./miquod_output)')
+    parser.add_argument('--no-images', action='store_true', help='do not write the intermediate images')
+    parser.add_argument('--show', action='store_true',
+                        help='display the intermediate images of the particle detection (blocks until closed)')
+    parser.add_argument('--quiet', action='store_true', help='print only errors and the output location')
+    parser.add_argument('--version', action='version', version='MIQUOD %s' % __version__)
+    args = parser.parse_args(argv)
+    if not 0 <= args.threshold <= 255:
+        parser.error('--threshold must be between 0 and 255')
+    return args
+
+
+def select_rois_interactively(image):
+    """Let the user draw one or more rectangles with OpenCV; returns a list of (x, y, w, h)."""
+    scale = min(1.0, 1200.0 / max(image.shape[0], image.shape[1]))
+    shown = cv2.resize(image, None, fx=scale, fy=scale) if scale < 1.0 else image
+    window = 'MIQUOD: draw the target(s); ENTER/SPACE confirms, ESC finishes'
+    rois = cv2.selectROIs(window, shown, showCrosshair=True, fromCenter=False)
+    cv2.destroyAllWindows()
+    out = []
+    for x, y, w, h in np.asarray(rois).reshape(-1, 4):
+        if w > 0 and h > 0:
+            out.append((int(round(x / scale)), int(round(y / scale)), int(round(w / scale)), int(round(h / scale))))
+    return out
+
+
+def resolve_targets(args, image):
+    if args.roi:
+        rois = [tuple(r) for r in args.roi]
+    elif args.select_roi:
+        rois = select_rois_interactively(image)
+        if not rois:
+            raise ValueError('no target area was selected')
+        print('Selected ROI(s): ' + ', '.join('--roi %d %d %d %d' % r for r in rois))
+    elif os.path.abspath(args.image) == os.path.abspath(DEFAULT_IMAGE):
+        rois = [DEFAULT_ROI]
+    else:
+        rois = [(0, 0, image.shape[1], image.shape[0])]
+    bitmap = Mf.BitMap(image)
+    targets = []
+    for roi in rois:
+        rect = Mf.Rectangle(*roi)
+        bitmap.check_rectangle(rect)
+        targets.append(rect)
+    return targets
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    verbose = not args.quiet
+    image = cv2.imread(args.image)
+    if image is None:
+        sys.exit('Could not read the image: %s' % args.image)
+    try:
+        targets = resolve_targets(args, image)
+    except ValueError as exc:
+        sys.exit('Error: %s' % exc)
+    out_dir = os.path.abspath(args.out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    image_dir = None if args.no_images else out_dir
+    if verbose:
+        print('MIQUOD %s' % __version__)
+        print('Image: %s (%d columns x %d rows)' % (args.image, image.shape[1], image.shape[0]))
+        for j, rect in enumerate(targets):
+            print('Target %d: %r' % (j, rect))
+
+    report = {'miquod_version': __version__, 'image': os.path.abspath(args.image),
+              'image_size': {'columns': int(image.shape[1]), 'rows': int(image.shape[0])},
+              'targets': [t.as_tuple() for t in targets], 'mode': args.mode}
+    started = time.time()
+    try:
+        if args.mode in ('particles', 'both'):
+            report['particle_settings'] = {'threshold': args.threshold, 'color': args.color,
+                                           'detector': Mf.DEFAULT_DETECTOR_SETTINGS}
+            if verbose:
+                print('\nParticle data (threshold %d, colour %s)' % (args.threshold, args.color))
+            particles = Mf.run_particle_analysis(image, targets, args.threshold, args.color, out_dir=image_dir,
+                                                 show=args.show, verbose=verbose)
+            report['particles'] = particles
+            if image_dir:
+                annotated = image
+                for j, rect in enumerate(targets):
+                    annotated = Mf.draw_particles(annotated, particles['particle_positions'][0][j], rect=rect)
+                cv2.imwrite(os.path.join(image_dir, 'particles_full_image.jpg'), annotated)
+        if args.mode in ('concentration', 'both'):
+            report['concentration_settings'] = {'dark_areas_higher_concentration': args.dark}
+            if verbose:
+                print('\nConcentration data (%s)' % ('dark areas = higher concentration' if args.dark
+                                                      else 'bright areas = higher concentration'))
+            concentration = Mf.run_concentration_analysis(image, targets, args.dark, verbose=verbose)
+            report['concentration'] = concentration
+            for j, array in enumerate(concentration['concentration_data'][0]):
+                np.save(os.path.join(out_dir, 'concentration_target%d.npy' % j), array)
+    except ValueError as exc:
+        sys.exit('Error: %s' % exc)
+    report['elapsed_seconds'] = round(time.time() - started, 2)
+
+    # The concentration arrays are saved as .npy; everything else goes into results.json.
+    jsonable = Mf.to_jsonable({k: v for k, v in report.items()})
+    if 'concentration' in jsonable:
+        jsonable['concentration'].pop('concentration_data', None)
+        jsonable['concentration']['concentration_data_files'] = [
+            'concentration_target%d.npy' % j for j in range(len(targets))]
+    with open(os.path.join(out_dir, 'results.json'), 'w', encoding='utf-8') as handle:
+        json.dump(jsonable, handle, indent=2)
+    print('\nResults written to %s (results.json%s)' % (out_dir, '' if args.no_images else ' and images'))
+    return 0
+
 
 if __name__ == '__main__':
-    im = cv2.imread('3colors_unmixed.png')
-    # r = cv2.selectROI('Image select', im)
-    # print(r)
-    img_to_process = [Mf.BitMap(im)]
-    LoadedImageInfo = ['Img1']
-    images_with_references = [[Mf.RefImg(0, 1)]]
-    # r = [144, 2, 295, 295]
-    # im2 = im[r[1]:r[1] + r[3], r[0]: r[0] + r[2]]
-    # r1 = Mf.Rectangle(2, 10, 556, 617)
-    # r1 = Mf.Rectangle(10, 17, 2700, 2180)  # inlet_3d
-    r1 = Mf.Rectangle(24, 82, 2700, 2180)  # inlet_3d
-    # r1 = Mf.Rectangle(50, 50, 2700, 2180)  # inlet_3d
-    store_target_areas = [[r1]]  # [#of picture][#of target area]=>rectangle dimensions
-    store_target_areas2 = [r1]
-    inlet_targets = [[0]]
-    img_to_process2 = img_to_process
-    storeConcentrationData = [[0.0]]
-    dark_checkbox = False  # Dark Areas Higher concentration
-    LoadedImageInfo2 = LoadedImageInfo
-    IntensityMeasures = [[0.0, 0.0],
-                         [0.0, 0.0]]  # type: List[List[float]] # [#picture][#target area]=>{σ,CoV,M,Cm,Cmax,Cmin, N}
-    Horizontal_Var_diagrams = [[0.0, 0.0], [0.0, 0.0]]  # [#of picture][#of target area]=> Horizontal Variogram
-    Vertical_Var_diagrams = [[0.0, 0.0], [0.0, 0.0]]  # [#of picture][#of target area]=> Vertical Variogram
-    MeanLengthScales = [[Mf.Coordinate(0, 0)],
-                        [Mf.Coordinate(0, 0)]]  # [#of picture,#of target area].X=> Horizontal mean length scale; Y vert
-    ExposureIndexes = [[0.0, 0.0], [0.0, 0.0]]  # [#of picture][#of target area]=> Exposure
-    threshold_value = 50
-    storePartPositions, store_blob_rectangles = Mf.blob_detection_image(img_to_process, threshold_value,
-                                                                        store_target_areas)
-    print('particles detected: ' + str(storePartPositions[0][0].__len__()))
-    MaxStrTargetSel = False
-    MaxStrTransSel = False
-    MeanSpacing = 0  # Mean spacing between particles in a target area
-    TargetNum = 0  # Target area to define transect
-    Trans_rect = Mf.Rectangle(0, 0, 1, 1)
-    MeanSpacingParticles, DefinedTransects, max_striation_thick = Mf.initiate_max_str_thickness(img_to_process,
-                                                                                                storePartPositions,
-                                                                                                store_target_areas)
-    print('mean space calculated: ' + str(MeanSpacingParticles))
-    print('defined transects calculated:  ' + str(DefinedTransects))
-    print('Max striation calculated:   ' + str(max_striation_thick))
-    # MaximumStriationThickness = [[0, 0], [0, 0]]
-    # endregion
-    # region Calculated Mixing dimensions (Particles)
-    storeConParticleData = [[0.0, 0.0], [0.0, 0.0]]  # [#of picture][#of target area]=>Particle concentration array
-    storeMaxStrThickness = [[0, 0],
-                            [0, 0]]  # type: List[List[int]] # [#picture][#targetarea]=>Maximum Striation Thickness
-    PNNDistribution = [[0.0, 0.0], [0.0, 0.0]]  # [#of picture,#of target area]=>PNN Distribution
-    ScaleSegregationIndexes = [[0.0, 0.0], [0.0, 0.0]]  # [#of picture,#of target area]=> {σfpp, Idisp, Xg}
-    #Mf.mixing_dim_concentration_data(img_to_process, store_target_areas, storeConcentrationData,
-    #                                 images_with_references, LoadedImageInfo, dark_checkbox, IntensityMeasures,
-    #                                 Horizontal_Var_diagrams, Vertical_Var_diagrams)
-    Mf.mixing_dim_particle_data(store_target_areas, LoadedImageInfo, storePartPositions, max_striation_thick)
+    sys.exit(main())
