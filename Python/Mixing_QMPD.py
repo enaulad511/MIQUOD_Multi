@@ -208,13 +208,89 @@ class BitMap:
         return [self.Img for _ in range(num)]
 
 
-# HSV ranges (OpenCV scale: H 0-180, S 0-255, V 0-255) used to isolate the dye of the particles.
+# HSV ranges (OpenCV scale: H 0-179, S 0-255, V 0-255) used to isolate the dye of the particles.
+# Each colour is a list of (lower, upper) bounds; red needs two because its hue wraps around 0.
 COLOR_RANGES = {
-    'red': (np.array([0, 100, 100]), np.array([10, 255, 255])),
-    'blue': (np.array([85, 100, 100]), np.array([130, 255, 255])),
-    'green': (np.array([50, 100, 100]), np.array([65, 255, 255])),
-    'yellow': (np.array([18, 100, 100]), np.array([38, 255, 255])),
+    'red': [(np.array([0, 100, 100]), np.array([10, 255, 255])),
+            (np.array([170, 100, 100]), np.array([179, 255, 255]))],
+    'blue': [(np.array([85, 100, 100]), np.array([130, 255, 255]))],
+    'green': [(np.array([50, 100, 100]), np.array([65, 255, 255]))],
+    'yellow': [(np.array([18, 100, 100]), np.array([38, 255, 255]))],
 }
+# BGR colours used to draw the particles of each dye colour.
+COLOR_DRAW = {'red': (0, 0, 255), 'blue': (255, 0, 0), 'green': (0, 255, 0), 'yellow': (0, 255, 255)}
+
+
+def hsv_ranges_from_hue(hue, tolerance=10, s_min=100, v_min=100):
+    """
+    HSV ``(lower, upper)`` bounds for ``hue ± tolerance`` on OpenCV's 0-179 hue scale, with saturation and
+    value of at least ``s_min`` and ``v_min``. Two ranges are returned when the interval wraps around 0.
+    This is the rule of the Android app (``calculateHSVThreshold``) applied to the hue of the dye colour.
+    """
+    hue = int(round(hue)) % 180
+    tolerance = int(tolerance)
+    if tolerance < 0:
+        raise ValueError('the hue tolerance must be positive')
+    s_min, v_min = int(s_min), int(v_min)
+
+    def bounds(low, high):
+        return np.array([low, s_min, v_min]), np.array([high, 255, 255])
+
+    if tolerance >= 90:
+        return [bounds(0, 179)]
+    low, high = hue - tolerance, hue + tolerance
+    if low < 0:
+        return [bounds(0, high), bounds(180 + low, 179)]
+    if high > 179:
+        return [bounds(low, 179), bounds(0, high - 180)]
+    return [bounds(low, high)]
+
+
+def resolve_color(color):
+    """
+    Turn a colour specification into a list of HSV ``(lower, upper)`` ranges. Accepted: a key of
+    ``COLOR_RANGES``, one ``(lower, upper)`` pair, a list of pairs, or a dict with ``hue`` and optional
+    ``tolerance``, ``s_min``, ``v_min`` (see ``hsv_ranges_from_hue``).
+    """
+    if isinstance(color, str):
+        if color not in COLOR_RANGES:
+            raise ValueError('unknown colour %r; choose one of %s' % (color, sorted(COLOR_RANGES)))
+        return list(COLOR_RANGES[color])
+    if isinstance(color, dict):
+        return hsv_ranges_from_hue(color['hue'], color.get('tolerance', 10), color.get('s_min', 100),
+                                   color.get('v_min', 100))
+    ranges = list(color)
+    if len(ranges) == 2 and np.ndim(ranges[0]) == 1:  # a single (lower, upper) pair
+        ranges = [tuple(ranges)]
+    return [(np.asarray(lower), np.asarray(upper)) for lower, upper in ranges]
+
+
+def color_mask(hsv, color):
+    """Binary mask (0/255) of the pixels of an HSV image that fall inside any range of the colour."""
+    mask = None
+    for lower, upper in resolve_color(color):
+        part = cv2.inRange(hsv, lower, upper)
+        mask = part if mask is None else cv2.bitwise_or(mask, part)
+    return mask
+
+
+def color_label(color):
+    """Short text for a colour specification: 'red', 'hue 60 ±10' or 'custom'."""
+    if isinstance(color, str):
+        return color
+    if isinstance(color, dict):
+        return 'hue %d ±%d' % (int(round(color['hue'])) % 180, int(color.get('tolerance', 10)))
+    return 'custom'
+
+
+def color_for_drawing(color):
+    """BGR colour used to draw the particles of a colour specification (the hue itself for custom hues)."""
+    if isinstance(color, str):
+        return COLOR_DRAW.get(color, (255, 255, 255))
+    if isinstance(color, dict):
+        pixel = np.array([[[int(round(color['hue'])) % 180, 255, 255]]], dtype=np.uint8)
+        return tuple(int(v) for v in cv2.cvtColor(pixel, cv2.COLOR_HSV2BGR)[0, 0])
+    return 255, 255, 255
 
 # Blob detector settings used by MIQUOD for particle counting.
 DEFAULT_DETECTOR_SETTINGS = dict(threshold=[150, 255], flag_area=True, limit_area=[1, 50],
@@ -328,9 +404,10 @@ def detect_particles_in_target(crop_bgr, threshold_value, color='red', detector=
 
     :param crop_bgr: BGR crop of the target area.
     :param threshold_value: gray threshold (0-255) applied before blob detection.
-    :param color: key of ``COLOR_RANGES`` ('red', 'blue', 'green', 'yellow').
+    :param color: colour specification accepted by ``resolve_color``: a key of ``COLOR_RANGES`` ('red',
+                  'blue', 'green', 'yellow'), HSV ``(lower, upper)`` ranges, or ``{'hue': h, ...}``.
     :param detector: a ``BlobDetector``; defaults to ``BlobDetector(**DEFAULT_DETECTOR_SETTINGS)``.
-    :param hsv_range: optional ``(lower, upper)`` HSV arrays overriding ``color``.
+    :param hsv_range: optional colour specification overriding ``color`` (kept for compatibility).
     :return: ``(key_points, stages)`` where ``stages`` is an ordered dict of the intermediate images
              ('crop', 'mask', 'color', 'gray', 'binary', 'particles') relative to the crop.
     """
@@ -338,13 +415,8 @@ def detect_particles_in_target(crop_bgr, threshold_value, color='red', detector=
         raise ValueError('detect_particles_in_target needs a BGR colour image')
     if detector is None:
         detector = BlobDetector(**DEFAULT_DETECTOR_SETTINGS)
-    if hsv_range is None:
-        if color not in COLOR_RANGES:
-            raise ValueError('unknown colour %r; choose one of %s' % (color, sorted(COLOR_RANGES)))
-        hsv_range = COLOR_RANGES[color]
-    lower, upper = hsv_range
     hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, np.asarray(lower), np.asarray(upper))
+    mask = color_mask(hsv, color if hsv_range is None else hsv_range)
     masked = cv2.bitwise_and(crop_bgr, crop_bgr, mask=mask)
     gray = cv2.cvtColor(masked, cv2.COLOR_BGR2GRAY)
     kernel = np.ones((2, 2), np.uint8)
@@ -392,15 +464,77 @@ def show_detection_stages(stages, title=''):
     plt.show()
 
 
+def montage_images(images, tile_width=480, columns=3, labels=True):
+    """
+    Arrange named images (dict name -> gray or BGR array) into one labelled BGR sheet, ``columns`` tiles
+    per row, every tile scaled to ``tile_width`` pixels wide.
+    """
+    if not images:
+        raise ValueError('montage_images needs at least one image')
+    pad = 8
+    label_h = 32 if labels else 0
+    names = list(images)
+    tiles = []
+    for name in names:
+        image = np.asarray(images[name])
+        if image.ndim == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        h, w = image.shape[:2]
+        tile_h = max(int(round(h * tile_width / float(w))), 1)
+        tiles.append(cv2.resize(image, (tile_width, tile_h), interpolation=cv2.INTER_AREA))
+    tile_height = max(tile.shape[0] for tile in tiles)
+    columns = max(1, min(columns, len(tiles)))
+    rows = (len(tiles) + columns - 1) // columns
+    sheet = np.full((rows * (tile_height + label_h) + (rows + 1) * pad, columns * tile_width + (columns + 1) * pad, 3),
+                    255, dtype=np.uint8)
+    for idx, (name, tile) in enumerate(zip(names, tiles)):
+        r, c = divmod(idx, columns)
+        x0 = pad + c * (tile_width + pad)
+        y0 = pad + r * (tile_height + label_h + pad) + label_h
+        sheet[y0:y0 + tile.shape[0], x0:x0 + tile_width] = tile
+        if labels:
+            cv2.putText(sheet, str(name), (x0, y0 - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+    return sheet
+
+
+def concentration_to_image(concentration, colormap=cv2.COLORMAP_JET):
+    """
+    Colour-map a concentration array (indexed ``[x][y]``, shape ``(Width, Height)``) into a BGR image
+    oriented like the image crop (rows, columns). Values are scaled between their minimum and maximum.
+    """
+    data = np.asarray(concentration, dtype=np.float64).T
+    finite = np.isfinite(data)
+    if finite.any():
+        lo, hi = float(data[finite].min()), float(data[finite].max())
+    else:
+        lo, hi = 0.0, 1.0
+    scaled = (data - lo) / (hi - lo) if hi > lo else np.zeros_like(data)
+    gray = np.clip(np.round(np.nan_to_num(scaled) * 255), 0, 255).astype(np.uint8)
+    return cv2.applyColorMap(gray, colormap)
+
+
+def concentration_stages(image_bgr, rect, concentration):
+    """
+    Intermediate images of the concentration path of one target: the crop, the median-filtered gray crop
+    and the colour-mapped concentration array (dict 'crop', 'filtered', 'concentration').
+    """
+    bitmap = BitMap(image_bgr)
+    crop = bitmap.clone(rect)
+    filtered = filter_image(bitmap).clone(rect)
+    return {'crop': crop, 'filtered': filtered, 'concentration': concentration_to_image(concentration)}
+
+
 def blob_detection_image(img_to_process, threshold_value, store_target_areas, color='red', detector=None,
-                         show=False, out_dir=None, verbose=True, stages_out=None):
+                         show=False, out_dir=None, verbose=True, stages_out=None, colors=None):
     """
     Detect the particles of every target of every image.
 
     :param img_to_process: list of ``BitMap``.
     :param threshold_value: gray threshold (0-255) applied before blob detection.
     :param store_target_areas: ``store_target_areas[image][target]`` -> ``Rectangle``.
-    :param color: dye colour of the particles, key of ``COLOR_RANGES``.
+    :param color: dye colour of the particles for every target (specification for ``resolve_color``).
+    :param colors: optional nested list ``colors[image][target]`` of colour specifications, one per target,
+                   which overrides ``color``.
     :param detector: optional ``BlobDetector`` (default ``DEFAULT_DETECTOR_SETTINGS``).
     :param show: display the intermediate images of each target with matplotlib (blocks).
     :param out_dir: if given, write the intermediate images there as
@@ -423,8 +557,9 @@ def blob_detection_image(img_to_process, threshold_value, store_target_areas, co
         if stages_out is not None:
             stages_out.append([])
         for trg_ind, area in enumerate(store_target_areas[index]):
+            spec = color if colors is None else colors[index][trg_ind]
             crop = img.clone(area)
-            key_points, stages = detect_particles_in_target(crop, threshold_value, color, detector)
+            key_points, stages = detect_particles_in_target(crop, threshold_value, spec, detector)
             if stages_out is not None:
                 stages_out[index].append(stages)
             positions = [Point(area.X + int(kp.pt[0]), area.Y + int(kp.pt[1])) for kp in key_points]
@@ -433,13 +568,16 @@ def blob_detection_image(img_to_process, threshold_value, store_target_areas, co
             store_part_pos[index].append(positions)
             store_blob_rectangles[index].append(rectangles)
             if verbose:
-                print('Image %d, target %d (%r): %d particles detected' % (index, trg_ind, area, len(positions)))
+                print('Image %d, target %d (%r, colour %s): %d particles detected'
+                      % (index, trg_ind, area, color_label(spec), len(positions)))
             if len(positions) == 0:
                 warnings.warn('Image %d, target %d: no particles detected; the particle measures cannot be '
                               'computed for this target (try another threshold or colour).' % (index, trg_ind))
             if out_dir:
                 for k, (name, im) in enumerate(stages.items(), start=1):
                     cv2.imwrite(os.path.join(out_dir, 'img%d_target%d_%d_%s.jpg' % (index, trg_ind, k, name)), im)
+                cv2.imwrite(os.path.join(out_dir, 'img%d_target%d_sequence.jpg' % (index, trg_ind)),
+                            montage_images(stages))
             if show:
                 show_detection_stages(stages, 'Image %d, target %d: %d particles' % (index, trg_ind, len(positions)))
     return store_part_pos, store_blob_rectangles
@@ -1175,27 +1313,47 @@ def full_image_data_array(image_index, img_to_process2):
 # region High-level helpers (CLI / GUI)
 
 
+class NotEnoughParticles(ValueError):
+    """
+    Raised by ``run_particle_analysis`` when a target has fewer than four particles. It carries what was
+    detected so a caller can show it: ``positions`` and ``rectangles`` (indexed ``[image][target]``) and
+    ``stages`` (``[image][target]`` dicts of intermediate images, or ``None`` when not collected).
+    """
+
+    def __init__(self, message, positions=None, rectangles=None, stages=None):
+        super().__init__(message)
+        self.positions = positions
+        self.rectangles = rectangles
+        self.stages = stages
+
+
 def run_particle_analysis(image_bgr, targets, threshold_value=50, color='red', detector=None, out_dir=None,
-                          show=False, verbose=False, horizontal=True, collect_stages=False):
+                          show=False, verbose=False, horizontal=True, collect_stages=False, colors=None):
     """
     Full particle-data pipeline for one image and a list of ``Rectangle`` targets.
 
+    :param color: colour specification used for every target (see ``resolve_color``).
+    :param colors: optional list with one colour specification per target, overriding ``color``.
     :return: the dictionary of ``mixing_dim_particle_data`` plus ``particle_positions``,
-             ``blob_rectangles``, ``mean_spacing``, ``transects`` and ``targets``; with
-             ``collect_stages`` also ``detection_stages`` (intermediate images per target).
+             ``blob_rectangles``, ``mean_spacing``, ``transects``, ``targets``, ``colors`` (label per
+             target) and ``color_ranges``; with ``collect_stages`` also ``detection_stages``.
     """
     img_to_process = [BitMap(image_bgr)]
     store_target_areas = [list(targets)]
     for rect in targets:
         img_to_process[0].check_rectangle(rect)
+    if colors is not None and len(colors) != len(targets):
+        raise ValueError('one colour per target is needed: %d targets, %d colours' % (len(targets), len(colors)))
+    per_target = list(colors) if colors is not None else [color] * len(targets)
     stages_out = [] if collect_stages else None
     positions, rectangles = blob_detection_image(img_to_process, threshold_value, store_target_areas, color=color,
                                                  detector=detector, show=show, out_dir=out_dir, verbose=verbose,
-                                                 stages_out=stages_out)
+                                                 stages_out=stages_out, colors=[per_target])
     for j, pts in enumerate(positions[0]):
         if len(pts) < 4:
-            raise ValueError('Target %d (%r): only %d particles detected; at least 4 are needed. Try another '
-                             'threshold or colour.' % (j, targets[j], len(pts)))
+            raise NotEnoughParticles('Target %d (%r): only %d particles detected; at least 4 are needed. Try '
+                                     'another threshold or colour.' % (j, targets[j], len(pts)),
+                                     positions=positions, rectangles=rectangles, stages=stages_out)
     mean_spacing, transects, max_striation = initiate_max_str_thickness(img_to_process, positions,
                                                                         store_target_areas, horizontal)
     results = mixing_dim_particle_data(store_target_areas, ['Img1'], positions, max_striation, verbose=verbose)
@@ -1203,16 +1361,58 @@ def run_particle_analysis(image_bgr, targets, threshold_value=50, color='red', d
                     'transects': transects, 'targets': store_target_areas})
     if collect_stages:
         results['detection_stages'] = stages_out
+    results['colors'] = [[color_label(spec) for spec in per_target]]
+    results['color_ranges'] = [[resolve_color(spec) for spec in per_target]]
     return results
 
 
-def run_concentration_analysis(image_bgr, targets, dark_areas_higher=False, verbose=False):
-    """Full concentration-data pipeline (no calibration) for one image and a list of ``Rectangle`` targets."""
+def run_particle_analysis_by_color(image_bgr, targets, colors, threshold_value=50, detector=None, out_dir=None,
+                                   show=False, verbose=False, horizontal=True, collect_stages=False):
+    """
+    ``run_particle_analysis`` once per dye colour, as the Android application does.
+
+    :param colors: list of colour names, or dict ``label -> colour specification`` (see ``resolve_color``).
+    :return: dict ``label -> results``. When a colour has too few particles its entry holds ``error`` (the
+             message) with ``particle_positions``, ``blob_rectangles`` and ``detection_stages`` instead of
+             the measures. With ``out_dir`` the images of each colour go to ``out_dir/<label>``.
+    """
+    if not isinstance(colors, dict):
+        colors = {str(c): c for c in colors}
+    if not colors:
+        raise ValueError('select at least one particle colour')
+    results = {}
+    for label, spec in colors.items():
+        label_dir = os.path.join(out_dir, str(label)) if out_dir else None
+        if verbose:
+            print('Particle colour: %s' % label)
+        try:
+            results[label] = run_particle_analysis(image_bgr, targets, threshold_value, spec, detector, label_dir,
+                                                   show, verbose, horizontal, collect_stages)
+        except NotEnoughParticles as exc:
+            if verbose:
+                print('  not computed: %s' % exc)
+            results[label] = {'error': str(exc), 'particle_positions': exc.positions,
+                              'blob_rectangles': exc.rectangles, 'detection_stages': exc.stages,
+                              'targets': [list(targets)], 'colors': [[color_label(spec)] * len(targets)],
+                              'color_ranges': [[resolve_color(spec)] * len(targets)]}
+    return results
+
+
+def run_concentration_analysis(image_bgr, targets, dark_areas_higher=False, verbose=False, collect_stages=False):
+    """
+    Full concentration-data pipeline (no calibration) for one image and a list of ``Rectangle`` targets.
+
+    With ``collect_stages`` the result also holds ``concentration_stages`` (crop, filtered crop and
+    colour-mapped concentration of every target, see ``concentration_stages``).
+    """
     img_to_process = [BitMap(image_bgr)]
     store_target_areas = [list(targets)]
     results = mixing_dim_concentration_data(img_to_process, store_target_areas, None, [[RefImg(0, 1)]], ['Img1'],
                                             dark_areas_higher, verbose=verbose)
     results['targets'] = store_target_areas
+    if collect_stages:
+        results['concentration_stages'] = [[concentration_stages(image_bgr, rect, results['concentration_data'][0][j])
+                                            for j, rect in enumerate(targets)]]
     return results
 
 

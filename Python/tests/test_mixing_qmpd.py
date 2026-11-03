@@ -375,6 +375,72 @@ def test_statistical_measures_particles():
     assert (x_min, x_max, n) == (0.0, 5.0, 4)
 
 
+def test_hsv_ranges_and_colour_masks():
+    import cv2
+    single = Mf.hsv_ranges_from_hue(60)
+    assert len(single) == 1 and single[0][0].tolist() == [50, 100, 100] and single[0][1].tolist() == [70, 255, 255]
+    assert [(int(a[0]), int(b[0])) for a, b in Mf.hsv_ranges_from_hue(5, 10)] == [(0, 15), (175, 179)]
+    assert [(int(a[0]), int(b[0])) for a, b in Mf.hsv_ranges_from_hue(175, 10)] == [(165, 179), (0, 5)]
+    assert len(Mf.hsv_ranges_from_hue(90, 90)) == 1
+    assert Mf.hsv_ranges_from_hue(30, 5, s_min=50, v_min=60)[0][0].tolist() == [25, 50, 60]
+    assert len(Mf.resolve_color('red')) == 2 and len(Mf.resolve_color('green')) == 1
+    assert len(Mf.resolve_color((np.array([0, 0, 0]), np.array([10, 255, 255])))) == 1
+    assert len(Mf.resolve_color({'hue': 175})) == 2
+    with pytest.raises(ValueError, match='unknown colour'):
+        Mf.resolve_color('purple')
+    # pure red (hue 0), pure green (60), magenta-red (175), black
+    bgr = np.array([[[0, 0, 255], [0, 255, 0], [40, 0, 255], [0, 0, 0]]], np.uint8)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    assert Mf.color_mask(hsv, 'red')[0].tolist() == [255, 0, 255, 0]
+    assert Mf.color_mask(hsv, 'green')[0].tolist() == [0, 255, 0, 0]
+    assert Mf.color_mask(hsv, {'hue': 0, 'tolerance': 3})[0].tolist() == [255, 0, 0, 0]
+    assert Mf.color_for_drawing('green') == (0, 255, 0) and Mf.color_for_drawing('hue 42') == (255, 255, 255)
+
+
+def test_particles_by_colour(tmp_path):
+    target = Mf.Rectangle(40, 30, 320, 240)
+    rows = range(40, 261, 20)
+    red = [(x, y) for y in rows for x in range(60, 157, 12)]
+    green = [(x, y) for y in rows for x in range(240, 337, 12)]
+    img = synthetic_particle_image((300, 400), red)
+    img = np.maximum(img, synthetic_particle_image((300, 400), green, color=(0, 255, 0)))
+    results = Mf.run_particle_analysis_by_color(img, [target], ['red', 'green', 'blue'], threshold_value=50,
+                                                out_dir=str(tmp_path), collect_stages=True)
+    assert list(results) == ['red', 'green', 'blue']
+    assert len(results['red']['particle_positions'][0][0]) == len(red) == 108
+    assert len(results['green']['particle_positions'][0][0]) == len(green) == 108
+    assert 'error' not in results['red'] and 'error' not in results['green']
+    assert results['red']['max_striation_thickness'][0][0] == 96
+    assert 'error' in results['blue'] and results['blue']['particle_positions'][0][0] == []
+    assert list(results['blue']['detection_stages'][0][0]) == ['crop', 'mask', 'color', 'gray', 'binary', 'particles']
+    assert (tmp_path / 'red' / 'img0_target0_sequence.jpg').exists()
+    assert (tmp_path / 'blue' / 'img0_target0_2_mask.jpg').exists()
+    custom = Mf.run_particle_analysis_by_color(img, [target], {'my green': {'hue': 60, 'tolerance': 5}})
+    assert len(custom['my green']['particle_positions'][0][0]) == 108
+    with pytest.raises(ValueError, match='at least one'):
+        Mf.run_particle_analysis_by_color(img, [target], [])
+
+
+def test_colour_per_target():
+    rows = range(40, 261, 20)
+    red = [(x, y) for y in rows for x in range(60, 157, 12)]
+    green = [(x, y) for y in rows for x in range(240, 337, 12)]
+    img = np.maximum(synthetic_particle_image((300, 400), red),
+                     synthetic_particle_image((300, 400), green, color=(0, 255, 0)))
+    left, right = Mf.Rectangle(40, 30, 150, 240), Mf.Rectangle(220, 30, 150, 240)
+    results = Mf.run_particle_analysis(img, [left, right], colors=['red', {'hue': 60, 'tolerance': 5}])
+    assert [len(t) for t in results['particle_positions'][0]] == [108, 108]
+    assert results['colors'] == [['red', 'hue 60 ±5']]
+    assert [len(r) for r in results['color_ranges'][0]] == [2, 1]
+    # the same targets with the colours swapped find nothing
+    with pytest.raises(Mf.NotEnoughParticles, match='Target 0'):
+        Mf.run_particle_analysis(img, [left, right], colors=['green', 'red'])
+    with pytest.raises(ValueError, match='one colour per target'):
+        Mf.run_particle_analysis(img, [left, right], colors=['red'])
+    assert Mf.color_label('red') == 'red' and Mf.color_label({'hue': 175}) == 'hue 175 ±10'
+    assert Mf.color_for_drawing('red') == (0, 0, 255) and Mf.color_for_drawing({'hue': 60}) == (0, 255, 0)
+
+
 def test_blob_detection_returns_absolute_positions():
     dots = [(120, 70), (150, 90), (180, 110), (210, 130), (140, 150), (190, 160)]
     img = synthetic_particle_image((300, 400), dots)
@@ -422,10 +488,36 @@ def test_full_particle_pipeline_on_synthetic_image():
     json.dumps(Mf.to_jsonable(results))
 
 
+def test_montage_and_concentration_images():
+    stages = {'a': np.zeros((40, 60, 3), np.uint8), 'b': np.full((40, 60), 128, np.uint8),
+              'c': np.zeros((40, 60, 3), np.uint8)}
+    sheet = Mf.montage_images(stages, tile_width=120, columns=2)
+    assert sheet.shape == (2 * (80 + 32) + 3 * 8, 2 * 120 + 3 * 8, 3)
+    assert Mf.montage_images({'only': stages['b']}, tile_width=60, labels=False).shape == (40 + 16, 60 + 16, 3)
+    with pytest.raises(ValueError):
+        Mf.montage_images({})
+    conc = np.array([[0.0, 0.5], [1.0, 0.25], [0.5, 0.5]])  # [x][y]: 3 columns, 2 rows
+    image = Mf.concentration_to_image(conc)
+    assert image.shape == (2, 3, 3)
+    assert not np.array_equal(image[0, 0], image[0, 1])  # 0 and 1 map to different colours
+    assert Mf.concentration_to_image(np.ones((3, 2))).shape == (2, 3, 3)  # uniform array does not crash
+    img = synthetic_particle_image((50, 70), [(20, 20)])
+    stages = Mf.concentration_stages(img, Mf.Rectangle(5, 5, 30, 20), conc)
+    assert list(stages) == ['crop', 'filtered', 'concentration']
+    assert stages['crop'].shape == (20, 30, 3) and stages['filtered'].shape == (20, 30)
+    assert stages['concentration'].shape == (2, 3, 3)
+
+
 def test_particle_pipeline_errors_are_explicit():
-    img = synthetic_particle_image((100, 100), [])
-    with pytest.raises(ValueError, match='only 0 particles'):
+    img = synthetic_particle_image((100, 100), [(50, 50)])
+    with pytest.raises(Mf.NotEnoughParticles, match='only 1 particles') as info:
+        Mf.run_particle_analysis(img, [Mf.Rectangle(0, 0, 100, 100)], collect_stages=True)
+    assert isinstance(info.value, ValueError)
+    assert len(info.value.positions[0][0]) == 1
+    assert list(info.value.stages[0][0]) == ['crop', 'mask', 'color', 'gray', 'binary', 'particles']
+    with pytest.raises(Mf.NotEnoughParticles) as info:
         Mf.run_particle_analysis(img, [Mf.Rectangle(0, 0, 100, 100)])
+    assert info.value.stages is None
     with pytest.raises(ValueError, match='outside the image'):
         Mf.run_particle_analysis(img, [Mf.Rectangle(50, 50, 100, 100)])
     with pytest.raises(ValueError, match='unknown colour'):
@@ -486,7 +578,10 @@ def test_concentration_without_calibration_orientation_and_dark_flag():
     dark = Mf.concentration_matrix([bm], [[rect]], None, [[Mf.RefImg(0, 1)]], ['Img1'], True)[0][0]
     np.testing.assert_allclose(dark, 1 - con)
     with pytest.warns(UserWarning, match='vertical mean length scale is infinite'):
-        results = Mf.run_concentration_analysis(img, [rect])
+        results = Mf.run_concentration_analysis(img, [rect], collect_stages=True)
+    stages = results['concentration_stages'][0][0]
+    assert list(stages) == ['crop', 'filtered', 'concentration']
+    assert stages['crop'].shape == (40, 50, 3) and stages['concentration'].shape == (40, 50, 3)
     hor, ver = results['horizontal_variograms'][0][0], results['vertical_variograms'][0][0]
     assert hor[1] > 0 and ver[1:].max() == 0
     lms = results['mean_length_scales'][0][0]
@@ -549,9 +644,15 @@ def test_uniform_image_cannot_be_normalised():
 def test_sample_image_regression():
     import cv2
     im = cv2.imread(SAMPLE_IMAGE)
-    # Same crop as the v2.0 default run (rows 24-2207, columns 82-2261): the detection is unchanged.
-    old_crop = Mf.run_particle_analysis(im, [Mf.Rectangle(82, 24, 2180, 2184)], 50, 'red')
+    # Same crop as the v2.0 default run (rows 24-2207, columns 82-2261). With the v2.0 red range (hue 0-10
+    # only) the detection is unchanged: 4956 particles; the v2.1 'red' also covers hue 170-179.
+    old_range = (np.array([0, 100, 100]), np.array([10, 255, 255]))
+    old_crop = Mf.run_particle_analysis(im, [Mf.Rectangle(82, 24, 2180, 2184)], 50, old_range)
     assert len(old_crop['particle_positions'][0][0]) == 4956
+    assert old_crop['mean_spacing'][0][0] == 22
+    assert old_crop['max_striation_thickness'][0][0] == 273
+    old_crop = Mf.run_particle_analysis(im, [Mf.Rectangle(82, 24, 2180, 2184)], 50, 'red')
+    assert len(old_crop['particle_positions'][0][0]) == 5162
     assert old_crop['mean_spacing'][0][0] == 22
     # Default configuration of MIQUOD_v1.py (v2.1).
     results = Mf.run_particle_analysis(im, [Mf.Rectangle(24, 82, 2700, 2120)], 50, 'red')
@@ -565,5 +666,5 @@ def test_sample_image_regression():
 
 
 # Reference values of the default particle run of MIQUOD_v1.py (v2.1), see docs/changes.md.
-REFERENCE = {'particles': 5589, 'max_striation_thickness': 361, 'cov': 0.9094732599597147,
-             'sigma_fpp': 195.40994717593975, 'i_dis': 354.44239558450107, 'xg': 43.08866115949653}
+REFERENCE = {'particles': 5800, 'max_striation_thickness': 361, 'cov': 0.9416022379612147,
+             'sigma_fpp': 195.8655952149924, 'i_dis': 356.08947777580835, 'xg': 41.95474902372032}

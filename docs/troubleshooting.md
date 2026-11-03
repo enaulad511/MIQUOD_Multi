@@ -34,10 +34,18 @@ or the warning **`no particles detected`**
 The colour mask or the threshold leaves nothing to detect. Check the `img*_target*_2_mask.jpg` and
 `_5_binary.jpg` images in the output folder (or the *Detection* tab of the application):
 
-- an empty mask: the particles are not in the HSV range of `--color`; try another colour;
+- an empty mask: the particles are not in the HSV range of the target's colour. The named colours cover
+  hue 0-10 and 170-179 (red), 18-38 (yellow), 50-65 (green) and 85-130 (blue) with saturation and value
+  of at least 100. In the application, hover over a particle to read its H, S and V, and right-click it to
+  use its hue as the custom colour of the target; on the command line use `--color hue:H`. Lower the
+  custom S or V minimum for pale or dim dyes;
 - a mask with particles but an empty binary image: lower `--threshold`;
 - blobs too large or too small: change the blob area limits (`DEFAULT_DETECTOR_SETTINGS['limit_area']`,
   or the *Blob area* fields of the application).
+
+In the application this is reported as a warning, not an error: the Sequence tab shows the images of the
+failed detection and the concentration results of the same run are kept. In the library the exception is
+`NotEnoughParticles`, which carries the detected positions and the stage images.
 
 **`the maximum striation thickness (N px) is larger than the target (...); no quadrat fits`**
 The particles form one continuous striation across the whole target (every gap between neighbouring

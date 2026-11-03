@@ -47,7 +47,7 @@ python MIQUOD_v1.py [IMAGE] [--roi X Y WIDTH HEIGHT]... [--select-roi]
 | `--select-roi` | Draw the targets with the mouse. ENTER or SPACE confirms a rectangle, ESC finishes. The chosen values are printed so they can be reused with `--roi`. | off |
 | `--mode` | `particles` (blob detection, striation thickness, PNN), `concentration` (intensity normalisation, variograms, length scales, exposure) or `both`. | `particles` |
 | `--threshold` | Gray threshold applied to the colour-masked image before blob detection. Lower values keep fainter particles. | `50` |
-| `--color` | Dye colour of the particles; selects the HSV range of the mask (`COLOR_RANGES` in the library). | `red` |
+| `--color COLOUR` | Particle colour of a target: `red`, `green`, `blue`, `yellow`, or `hue:H[:TOL[:SMIN[:VMIN]]]` for a custom hue (OpenCV scale 0-179, tolerance 10 and minimum saturation and value 100 by default). Repeat it once per `--roi`, in the same order, to give each target its own colour; a single `--color` applies to every target. | `red` |
 | `--dark` | Concentration data: dark pixels carry the higher concentration (`c = 1 - normalised intensity`). | off |
 | `--out-dir DIR` | Output folder, created if needed. | `./miquod_output` |
 | `--no-images` | Do not write the intermediate images. | off |
@@ -61,8 +61,13 @@ python MIQUOD_v1.py
 python MIQUOD_v1.py sample.png --roi 24 82 2700 2120 --mode both
 python MIQUOD_v1.py sample.png --select-roi --mode concentration --dark
 python MIQUOD_v1.py sample.png --roi 0 0 500 500 --roi 600 0 500 500 --color blue --threshold 60 --show
-python MIQUOD_v1.py sample.png --roi 0 0 500 500 --quiet --no-images --out-dir results/run1
+python MIQUOD_v1.py sample.png --roi 24 82 900 2120 --color green --roi 1400 82 1300 2120 --color red
+python MIQUOD_v1.py sample.png --roi 0 0 500 500 --color hue:175:8 --quiet --no-images --out-dir results/run1
 ```
+
+The named colours cover these hue ranges (OpenCV scale, saturation and value at least 100): red 0-10 and
+170-179, yellow 18-38, green 50-65, blue 85-130. For a dye outside them use `hue:H`; the application
+shows the hue of any pixel under the mouse.
 
 The tool exits with a message (no traceback) when the image cannot be read, a target lies outside the
 image, fewer than four particles are detected, the maximum striation thickness does not fit in the
@@ -76,13 +81,19 @@ Inside `--out-dir`:
 |---|---|
 | `results.json` | Everything below, plus the image path and size, the targets, the settings and the elapsed time. |
 | `img{i}_target{j}_1_crop.jpg` ... `_6_particles.jpg` | Particle detection stages of image `i`, target `j`: crop, HSV mask, colour-masked crop, grayscale, binary image given to the blob detector, crop with the detected particles circled. |
+| `img{i}_target{j}_sequence.jpg` | The six particle stages on one labelled sheet. |
 | `particles_full_image.jpg` | The whole image with every target and its particles drawn. |
+| `concentration_target{j}_1_crop.jpg`, `_2_filtered.jpg`, `_3_concentration.jpg` | Concentration stages of target `j`: crop, median-filtered gray crop, colour-mapped concentration (JET colour map scaled between the minimum and maximum of the target). |
+| `concentration_target{j}_sequence.jpg` | The three concentration stages on one labelled sheet. |
 | `concentration_target{j}.npy` | Concentration array of target `j`, shape `(Width, Height)`, indexed `[x][y]`. Load with `numpy.load`. |
 
 `results.json` keys (lists are indexed `[image][target]`; the command line processes one image, so the
 image index is always 0):
 
-- `particles`: `particle_positions` (absolute `{X, Y}` = column, row), `blob_rectangles`, `mean_spacing`,
+- `targets`: one entry per target with `rectangle` (`[X, Y, Width, Height]`), `color` (label) and
+  `color_spec`.
+- `particles`: `colors` (label per target), `color_ranges` (HSV bounds per target), `particle_positions`
+  (absolute `{X, Y}` = column, row), `blob_rectangles`, `mean_spacing`,
   `transects` (the transect where the maximum striation was found), `max_striation_thickness`,
   `particle_concentration` (quadrat concentrations), `intensity_measures` (`[σ, CoV, M, Cm, Cmax, Cmin, n, N]`),
   `pnn_distribution`, `pnn_parameters` (`xr, xg, dx, dy, k, xs, var_fpp, xi_mean, m`),
@@ -102,19 +113,33 @@ The window follows the flow of the Android application:
 1. **Image**: *Open image...* loads a file. Its name and size appear below the button.
 2. **Target areas**: click and drag on the image to draw a target. Targets can also be typed (X, Y, width,
    height) and added, set to the whole image, removed or cleared. The selected target is highlighted and
-   its values are shown in the entry boxes.
-3. **Parameters**: data type (particles, concentration or both), particle colour, gray threshold, blob
-   area limits and the *dark areas = higher concentration* option.
-4. **Process**: runs the analysis in the background; the status line reports progress and errors.
+   its values are shown in the entry boxes. **Each target has its own particle colour**: choose it in the
+   *Particle colour* box before drawing (new targets take it), or select a target in the list, change the
+   box and press *Apply to selected target*. Besides red, green, blue and yellow, *custom* takes a hue
+   (0-179), a tolerance and the minimum saturation and value. Hovering over the image shows the H, S, V and
+   R, G, B of the pixel under the mouse in the line below the image; a right click on a particle copies its
+   hue into the custom colour and applies it to the selected target (or to the next targets if none is
+   selected). To detect two colours in the same region, draw two targets with the same rectangle.
+3. **Parameters**: data type (particles, concentration or both), gray threshold, blob area limits and the
+   *dark areas = higher concentration* option.
+4. **Process**: runs the analysis in the background; the status line reports progress and errors. When a
+   target has fewer than four particles the particle measures are not computed, but the detection images
+   are kept in the Sequence and Detection tabs (and the concentration results of the same run are shown)
+   so the threshold, colour or blob area can be adjusted before processing again.
 5. **Results**: *Export results (JSON)...* writes the same content as the command line (`results.json` and
    one `.npy` per target for the concentration arrays, next to the JSON file). *Save annotated image...*
-   writes the image with the targets and particles drawn.
+   writes the image with the targets and particles drawn. *Export images (all stages)...* writes every
+   image generated for every target into a folder: `target{j}_{k}_{stage}.png` in processing order, one
+   `target{j}_sequence.png` sheet per target with all its stages, and `annotated_full_image.png`.
 
 Tabs on the right:
 
 - **Image**: the image with the targets; after a particle run, the detected particles are drawn on it.
 - **Results**: the measures of every target, the settings used and any warning.
-- **Detection**: the intermediate images of the particle detection, per target and stage.
+- **Detection**: one intermediate image at a time, chosen by target and stage.
+- **Sequence**: every image generated for the selected target, in processing order: the six particle
+  stages (crop, mask, colour, gray, binary, particles) and the concentration stages (filtered crop,
+  colour-mapped concentration). Click an image to open it in the Detection tab.
 - **Variograms**: horizontal and vertical variograms of every target (concentration data).
 
 ## Library: `Mixing_QMPD.py`
@@ -139,7 +164,11 @@ for j, target in enumerate(targets):
 ```
 
 `run_particle_analysis` accepts a custom `detector=Mf.BlobDetector(...)` (see `DEFAULT_DETECTOR_SETTINGS`)
-and `collect_stages=True` to get the intermediate images in `detection_stages`.
+and `collect_stages=True` to get the intermediate images in `detection_stages`. The particle colour is
+`color` for every target, or `colors=[...]` with one specification per target: a name (`'red'`, `'green'`,
+`'blue'`, `'yellow'`), a dict `{'hue': 60, 'tolerance': 10, 's_min': 100, 'v_min': 100}`, or explicit HSV
+`(lower, upper)` bounds. `run_particle_analysis_by_color(image, targets, ['red', 'green'])` runs the
+whole pipeline once per colour and returns a dictionary keyed by colour, like the Android application.
 
 ### Several images, calibration with reference images
 

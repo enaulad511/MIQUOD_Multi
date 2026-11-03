@@ -30,23 +30,56 @@ in [method.md](method.md).
 | `BitMap(img)` | Wraps a numpy image. `Width`, `Height`, `Dimension` (2 for gray, 3 for BGR), `Img`. `clone(rect)` returns the crop (a view) after `check_rectangle(rect)`, which raises `ValueError` when the rectangle is not inside the image. `pixel(x, y, layer)` returns one pixel (`layer` 'R', 'G' or 'B' for BGR images). `BitMap(None)` raises `ValueError`. |
 | `BlobDetector(threshold, flag_area, limit_area, flag_circularity, min_cir, flag_convexity, convexity, flag_inertia, ratio_inertia, flag_color)` | Wrapper of `cv2.SimpleBlobDetector`. `detect_blobs(img)` returns key points; `rectangles(points)` their bounding squares. |
 
-Constants: `COLOR_RANGES` (HSV lower/upper bounds for `'red'`, `'blue'`, `'green'`, `'yellow'`),
-`DEFAULT_DETECTOR_SETTINGS` (keyword arguments of the `BlobDetector` used for particle counting),
-`__version__`.
+Constants: `COLOR_RANGES` (list of HSV `(lower, upper)` bounds per named colour: red 0-10 and 170-179,
+yellow 18-38, green 50-65, blue 85-130, all with saturation and value of at least 100), `COLOR_DRAW` (BGR
+colour used to draw each named colour), `DEFAULT_DETECTOR_SETTINGS` (keyword arguments of the
+`BlobDetector` used for particle counting), `__version__`.
+
+## Colour specifications
+
+A particle colour is given as a name of `COLOR_RANGES`, a dict `{'hue': h, 'tolerance': 10, 's_min': 100,
+'v_min': 100}` (hue on OpenCV's 0-179 scale), one HSV `(lower, upper)` pair, or a list of pairs.
+
+| Function | Description |
+|---|---|
+| `hsv_ranges_from_hue(hue, tolerance=10, s_min=100, v_min=100)` | HSV bounds for `hue ± tolerance`; two ranges when the interval wraps around 0 (the rule of the Android app). |
+| `resolve_color(color)` | Any specification -> list of `(lower, upper)` arrays. Raises `ValueError` for an unknown name. |
+| `color_mask(hsv, color)` | Binary mask (0/255) of the pixels of an HSV image inside any range of the colour. |
+| `color_label(color)` | Text for a specification: `'red'`, `'hue 60 ±10'`, `'custom'`. |
+| `color_for_drawing(color)` | BGR colour to draw particles of that specification. |
 
 ## High-level functions
 
-### `run_particle_analysis(image_bgr, targets, threshold_value=50, color='red', detector=None, out_dir=None, show=False, verbose=False, horizontal=True, collect_stages=False)`
+### `run_particle_analysis(image_bgr, targets, threshold_value=50, color='red', detector=None, out_dir=None, show=False, verbose=False, horizontal=True, collect_stages=False, colors=None)`
 
-Full particle pipeline for one image and a list of `Rectangle`. Returns the dictionary of
-`mixing_dim_particle_data` plus `particle_positions`, `blob_rectangles`, `mean_spacing`, `transects`,
-`targets` and, with `collect_stages`, `detection_stages`. Raises `ValueError` when a target is outside the
-image or has fewer than four particles.
+Full particle pipeline for one image and a list of `Rectangle`. `color` applies to every target; `colors`
+gives one specification per target. Returns the dictionary of `mixing_dim_particle_data` plus
+`particle_positions`, `blob_rectangles`, `mean_spacing`, `transects`, `targets`, `colors` (label per
+target), `color_ranges` and, with `collect_stages`, `detection_stages`. Raises `ValueError` when a target is
+outside the image or the number of colours does not match, and `NotEnoughParticles` (a `ValueError`
+subclass with the attributes `positions`, `rectangles` and `stages` holding what was detected) when a
+target has fewer than four particles.
 
-### `run_concentration_analysis(image_bgr, targets, dark_areas_higher=False, verbose=False)`
+### `run_particle_analysis_by_color(image_bgr, targets, colors, threshold_value=50, detector=None, out_dir=None, show=False, verbose=False, horizontal=True, collect_stages=False)`
+
+`run_particle_analysis` once per colour (a list of names or a dict `label -> specification`), as the
+Android application does. Returns `label -> results`; a colour with too few particles gets an entry with
+`error` and the detected `particle_positions`, `blob_rectangles` and `detection_stages`. Images go to
+`out_dir/<label>`.
+
+### `run_concentration_analysis(image_bgr, targets, dark_areas_higher=False, verbose=False, collect_stages=False)`
 
 Full concentration pipeline (no calibration) for one image. Returns the dictionary of
-`mixing_dim_concentration_data` plus `targets`.
+`mixing_dim_concentration_data` plus `targets` and, with `collect_stages`, `concentration_stages`
+(the dictionaries of `concentration_stages` per target).
+
+### Images
+
+| Function | Description |
+|---|---|
+| `montage_images(images, tile_width=480, columns=3, labels=True)` | One labelled BGR sheet with the named images (gray or BGR) as tiles of `tile_width` pixels, `columns` per row. Used for the `*_sequence.jpg` files. |
+| `concentration_to_image(concentration, colormap=cv2.COLORMAP_JET)` | Colour map of a concentration array (`[x][y]`), returned as a BGR image oriented like the crop and scaled between the array's minimum and maximum. |
+| `concentration_stages(image_bgr, rect, concentration)` | Dict `crop`, `filtered` (median-filtered gray crop), `concentration` (colour map) of one target. |
 
 ### `to_jsonable(obj)`
 
@@ -57,8 +90,8 @@ dictionaries) into values accepted by `json.dump`.
 
 | Function | Description |
 |---|---|
-| `detect_particles_in_target(crop_bgr, threshold_value, color='red', detector=None, hsv_range=None)` | Detection pipeline of one crop. Returns `(key_points, stages)`; `stages` is a dict of the intermediate images `crop`, `mask`, `color`, `gray`, `binary`, `particles`. |
-| `blob_detection_image(img_to_process, threshold_value, store_target_areas, color='red', detector=None, show=False, out_dir=None, verbose=True, stages_out=None)` | Detection of every target of every `BitMap`. Returns `(store_part_pos, store_blob_rectangles)` indexed `[image][target]` with absolute positions. Writes the stages to `out_dir` as `img{i}_target{j}_{k}_{stage}.jpg`; appends them to `stages_out` when given. Warns when a target has no particle. |
+| `detect_particles_in_target(crop_bgr, threshold_value, color='red', detector=None, hsv_range=None)` | Detection pipeline of one crop for one colour specification. Returns `(key_points, stages)`; `stages` is a dict of the intermediate images `crop`, `mask`, `color`, `gray`, `binary`, `particles`. |
+| `blob_detection_image(img_to_process, threshold_value, store_target_areas, color='red', detector=None, show=False, out_dir=None, verbose=True, stages_out=None, colors=None)` | Detection of every target of every `BitMap`; `colors[image][target]` gives each target its own colour. Returns `(store_part_pos, store_blob_rectangles)` indexed `[image][target]` with absolute positions. Writes the stages to `out_dir` as `img{i}_target{j}_{k}_{stage}.jpg` plus a `img{i}_target{j}_sequence.jpg` sheet; appends them to `stages_out` when given. Warns when a target has no particle. |
 | `annotate_particles(image_bgr, key_points, color=(255, 255, 255), thickness=4)` | Copy of the crop with a circle around every key point. |
 | `draw_particles(image_bgr, points, radius=4, color=(255, 255, 255), thickness=2, rect=None)` | Copy of the full image with the absolute positions and, optionally, the target drawn. |
 | `show_detection_stages(stages, title='')` | Shows the stages with matplotlib (blocking). |
@@ -115,7 +148,8 @@ therefore selects the normalisation.
 |---|---|
 | `BitMap(None)` (image not read) | `ValueError: BitMap received None ...` |
 | Target not inside the image | `ValueError: target area Rectangle(...) lies outside the image (...)` |
-| Fewer than 2 particles (mean spacing) / fewer than 4 (scale of segregation, `run_particle_analysis`) | `ValueError` naming the target and the count |
+| Fewer than 2 particles (mean spacing) / fewer than 4 (scale of segregation) | `ValueError` naming the target and the count |
+| Fewer than 4 particles in `run_particle_analysis` | `NotEnoughParticles` (subclass of `ValueError`) carrying the detected positions and stage images |
 | Maximum striation thickness larger than the target | `ValueError: ... no quadrat fits` |
 | Uniform image (cannot normalise) or uniform target (`σ = 0`) | `ValueError` |
 | Mean concentration zero with non-zero deviation | `ValueError` |

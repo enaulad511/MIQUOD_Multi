@@ -57,12 +57,28 @@ port still has the 2.0 expression.
 | Run | Particles | Mean spacing | Max. striation | CoV | M | σ_fpp | i_dis | xg |
 |---|---|---|---|---|---|---|---|---|
 | 2.0 default (`Rectangle(24, 82, 2700, 2180)`, rows 24-2207, cols 82-2261) | 4956 | 22 | 273 | 1.1236 | 0 | 217.39 | 323.78 | 45.91 |
-| 2.1, same crop (`Rectangle(82, 24, 2180, 2184)`) | 4956 | 22 | 273 | 0.9091 | 0.0909 | 193.85 | 336.10 | 39.77 |
-| 2.1 default (`Rectangle(24, 82, 2700, 2120)`) | 5589 | 24 | 361 | 0.9095 | 0.0905 | 195.41 | 354.44 | 43.09 |
+| 2.1, same crop, 2.0 red range (hue 0-10) | 4956 | 22 | 273 | 0.9091 | 0.0909 | 193.85 | 336.10 | 39.77 |
+| 2.1, same crop (`Rectangle(82, 24, 2180, 2184)`) | 5162 | 22 | 295 | 0.9004 | 0.0996 | 194.00 | 337.12 | 39.21 |
+| 2.1 default (`Rectangle(24, 82, 2700, 2120)`), 2.0 red range | 5589 | 24 | 361 | 0.9095 | 0.0905 | 195.41 | 354.44 | 43.09 |
+| 2.1 default (`Rectangle(24, 82, 2700, 2120)`) | 5800 | 24 | 361 | 0.9416 | 0.0584 | 195.87 | 356.09 | 41.95 |
 
-The detection, the mean spacing and the maximum striation thickness of the old crop are unchanged
-because they do not depend on the offset. The quadrat concentrations and the PNN distribution of the old
-crop differ from 2.0 because the particles are now compared with the grid in the same coordinates.
+With the 2.0 red range, the detection, the mean spacing and the maximum striation thickness of the old
+crop are unchanged because they do not depend on the offset; the quadrat concentrations and the PNN
+distribution differ because the particles are now compared with the grid in the same coordinates.
+
+### Red hue range
+
+Red sits at both ends of the hue circle. The 2.0 mask kept hue 0-10 only; the 2.1 `'red'` also keeps hue
+170-179 (with saturation and value at least 100), which is what `hue 0 ± 10` means. On the sample target
+this adds 211 particles. The 2.0 range is still available as an explicit specification
+(`(np.array([0, 100, 100]), np.array([10, 255, 255]))`), and the slow test checks both.
+
+### Colour per target
+
+Each target can have its own particle colour (`colors=` in `run_particle_analysis`, one `--color` per
+`--roi` on the command line, the colour box of the application), including a custom hue with tolerance and
+minimum saturation and value. `run_particle_analysis_by_color` runs the pipeline once per colour for all
+targets, as the Android application does.
 
 ### Concentration data (2.1 default target, no calibration)
 
@@ -113,9 +129,12 @@ numbers. They can be revisited later.
   return dictionaries. The old positional arguments are still accepted; the pre-allocated result lists
   of the 2.0 script are ignored.
 - New: `detect_particles_in_target`, `annotate_particles`, `draw_particles`, `show_detection_stages`,
-  `run_particle_analysis`, `run_concentration_analysis`, `summarize_particle_results`,
-  `summarize_concentration_results`, `to_jsonable`, `COLOR_RANGES`, `DEFAULT_DETECTOR_SETTINGS`,
-  `Rectangle.right/bottom/area/contains/as_tuple`, `BitMap.check_rectangle`.
+  `montage_images`, `concentration_to_image`, `concentration_stages`, `hsv_ranges_from_hue`,
+  `resolve_color`, `color_mask`, `color_label`, `color_for_drawing`, `run_particle_analysis`,
+  `run_particle_analysis_by_color`, `run_concentration_analysis`, `summarize_particle_results`,
+  `summarize_concentration_results`, `to_jsonable`, `NotEnoughParticles`, `COLOR_RANGES` (lists of ranges),
+  `COLOR_DRAW`, `DEFAULT_DETECTOR_SETTINGS`, `Rectangle.right/bottom/area/contains/as_tuple`,
+  `BitMap.check_rectangle`.
 - `ideal_particle_position` still returns a list of `Point`; `pnn_method_distribution` returns numpy
   arrays.
 - `BitMap.pixel(x, y, 'R')` now returns the red channel of a BGR image (it returned the blue one).
