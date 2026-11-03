@@ -167,6 +167,8 @@ class BlobDetector:
             threshold = [120, 255]
         # Setup SimpleBlobDetector parameters.
         params = cv2.SimpleBlobDetector_Params()
+        # Current OpenCV rejects a minimum of exactly 0 for these ratios, even when the filter is disabled.
+        min_ratio = 1e-6
 
         # Change thresholds
         params.minThreshold = threshold[0]
@@ -179,16 +181,16 @@ class BlobDetector:
 
         # Filter by Circularity
         params.filterByCircularity = flag_circularity
-        params.minCircularity = min_cir
+        params.minCircularity = max(min_cir, min_ratio)
 
         # Filter by Convexity
         params.filterByConvexity = flag_convexity
-        params.minConvexity = convexity[0]
+        params.minConvexity = max(convexity[0], min_ratio)
         params.maxConvexity = convexity[1]
 
         # Filter by Inertia (ratio of widest to thinnest point)
         params.filterByInertia = flag_inertia
-        params.minInertiaRatio = ratio_inertia[0]
+        params.minInertiaRatio = max(ratio_inertia[0], min_ratio)
         params.maxInertiaRatio = ratio_inertia[1]
 
         params.filterByColor = flag_color
