@@ -1,24 +1,44 @@
 cff-version: 1.2.0
-message: "If you use this software, please cite it as below."
+message: "If you use this software, please cite the article below."
 authors:
-- family-names: "YOUR_NAME_HERE"
-  given-names: "YOUR_NAME_HERE"
-  orcid: "https://orcid.org/0000-0000-0000-0000"
-- family-names: "Lisa"
-  given-names: "Mona"
-  orcid: "https://orcid.org/0000-0000-0000-0000"
+- family-names: "Naula Duchi"
+  given-names: "Edisson A."
+  orcid: "https://orcid.org/0000-0003-4620-0908"
+- family-names: "Betancourt Cervantes"
+  given-names: "Héctor Andrés"
 title: "MIQUOD_Multi"
+abstract: "MIQUOD quantifies mixing from images. Edisson A. Naula Duchi is the main author; Héctor Andrés Betancourt Cervantes wrote the original C# version (1.0, 2017)."
 version: 1.0.0
-doi: 10.5281/zenodo.1234
 date-released: 2023-11-06
 url: "https://github.com/enaulad511/MIQUOD_Multi"
-
-@article{E.Naula_2017,
-  author = {Edisson Andrés Naula Duchi, José Israel Martínez López},
-  doi = {10.5281/zenodo.1234},
-  month = {12},
-  title = {{My Research Software}},
-  url = {https://github.com/github-linguist/linguist},
-  version = {2.0.4},
-  year = {2023}
-}
+preferred-citation:
+  type: article
+  title: "Particle Tracking and Micromixing Performance Characterization with a Mobile Device"
+  authors:
+  - family-names: "Naula Duchi"
+    given-names: "Edisson A."
+    orcid: "https://orcid.org/0000-0003-4620-0908"
+  - family-names: "Betancourt Cervantes"
+    given-names: "Héctor Andrés"
+  - family-names: "Yañez Espinosa"
+    given-names: "Christian Rodrigo"
+  - family-names: "Rodríguez"
+    given-names: "Ciro A."
+    orcid: "https://orcid.org/0000-0003-2289-4239"
+  - family-names: "Garza-Castañon"
+    given-names: "Luis E."
+    orcid: "https://orcid.org/0000-0001-9752-6022"
+  - family-names: "Martínez López"
+    given-names: "J. Israel"
+    orcid: "https://orcid.org/0000-0001-7475-8138"
+  journal: "Sensors"
+  publisher:
+    name: "MDPI AG"
+  issn: "1424-8220"
+  volume: 23
+  issue: 24
+  start: 9900
+  year: 2023
+  month: 12
+  doi: 10.3390/s23249900
+  url: "https://www.mdpi.com/1424-8220/23/24/9900"
