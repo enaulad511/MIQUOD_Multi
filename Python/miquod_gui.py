@@ -230,6 +230,8 @@ class MiquodApp(tk.Tk):
         self.image_path = None
         self.targets = []
         self.target_colors = []  # one colour specification per target (name or {'hue': ...})
+        self.target_areas = []  # one [min_area, max_area] per target
+        self.target_split = []  # one "split touching particles" flag per target
         self.hsv = None
         self.results = None
         self.sequence = {}
@@ -303,8 +305,20 @@ class MiquodApp(tk.Tk):
             spin = ttk.Spinbox(custom_row, from_=0, to=upper, textvariable=var, width=4)
             spin.pack(side='left', padx=(2, 6))
             self.custom_widgets.append(spin)
-        ttk.Label(box, text='New targets take this colour. Hover over the image to read the H, S, V of a pixel; '
-                            'right-click a particle to use its hue as the custom colour.',
+        area_row = ttk.Frame(box)
+        area_row.pack(fill='x', pady=(4, 0))
+        ttk.Label(area_row, text='Blob area min / max (px)').pack(side='left')
+        self.area_min_var = tk.IntVar(value=Mf.DEFAULT_DETECTOR_SETTINGS['limit_area'][0])
+        self.area_max_var = tk.IntVar(value=Mf.DEFAULT_DETECTOR_SETTINGS['limit_area'][1])
+        ttk.Spinbox(area_row, from_=1, to=10000000, textvariable=self.area_min_var, width=7).pack(side='left',
+                                                                                                padx=(4, 2))
+        ttk.Spinbox(area_row, from_=1, to=10000000, textvariable=self.area_max_var, width=7).pack(side='left')
+        self.split_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text='Split touching particles (large beads in contact)',
+                        variable=self.split_var).pack(anchor='w', pady=(4, 0))
+        ttk.Label(box, text='New targets take this colour, area and option. Hover over the image to read the '
+                            'H, S, V of a pixel; right-click a particle to use its hue as the custom colour and '
+                            'its size to set the blob area limits.',
                   wraplength=300).pack(fill='x', pady=(4, 0))
         self._update_custom_state()
 
@@ -323,13 +337,6 @@ class MiquodApp(tk.Tk):
         self.threshold_var = tk.IntVar(value=50)
         ttk.Spinbox(grid, from_=0, to=255, textvariable=self.threshold_var, width=8).grid(row=1, column=1, sticky='w',
                                                                                           padx=4, pady=2)
-        ttk.Label(grid, text='Blob area min / max (px)').grid(row=2, column=0, sticky='w')
-        area_row = ttk.Frame(grid)
-        area_row.grid(row=2, column=1, sticky='w', padx=4, pady=2)
-        self.area_min_var = tk.IntVar(value=Mf.DEFAULT_DETECTOR_SETTINGS['limit_area'][0])
-        self.area_max_var = tk.IntVar(value=Mf.DEFAULT_DETECTOR_SETTINGS['limit_area'][1])
-        ttk.Spinbox(area_row, from_=1, to=100000, textvariable=self.area_min_var, width=6).pack(side='left')
-        ttk.Spinbox(area_row, from_=1, to=100000, textvariable=self.area_max_var, width=6).pack(side='left', padx=(4, 0))
         self.dark_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(grid, text='Dark areas = higher concentration', variable=self.dark_var).grid(
             row=3, column=0, columnspan=2, sticky='w', pady=2)
@@ -436,6 +443,8 @@ class MiquodApp(tk.Tk):
         self.image_path = path
         self.targets = []
         self.target_colors = []
+        self.target_areas = []
+        self.target_split = []
         self.results = None
         self.sequence = {}
         self.annotated = None
@@ -464,7 +473,21 @@ class MiquodApp(tk.Tk):
         return {'hue': int(self.hue_var.get()) % 180, 'tolerance': int(self.hue_tol_var.get()),
                 's_min': int(self.s_min_var.get()), 'v_min': int(self.v_min_var.get())}
 
-    def _show_color_in_controls(self, spec):
+    def _current_area(self):
+        """Blob area limits selected in the controls, validated."""
+        low, high = int(self.area_min_var.get()), int(self.area_max_var.get())
+        if low < 1 or high < low:
+            raise ValueError('The blob area limits must satisfy 1 <= min <= max.')
+        return [low, high]
+
+    def _current_particle_settings(self):
+        """(colour specification, area limits, split flag) selected in the controls."""
+        try:
+            return self._current_color_spec(), self._current_area(), bool(self.split_var.get())
+        except tk.TclError:
+            raise ValueError('Enter integer values for the custom hue, tolerance, S, V and the blob area limits.')
+
+    def _show_color_in_controls(self, spec, area=None, split=None):
         if isinstance(spec, dict):
             self.color_var.set('custom')
             self.hue_var.set(spec['hue'])
@@ -473,7 +496,16 @@ class MiquodApp(tk.Tk):
             self.v_min_var.set(spec.get('v_min', 100))
         else:
             self.color_var.set(spec)
+        if area is not None:
+            self.area_min_var.set(area[0])
+            self.area_max_var.set(area[1])
+        if split is not None:
+            self.split_var.set(split)
         self._update_custom_state()
+
+    @staticmethod
+    def _describe_target(spec, area, split):
+        return '%s, area %d-%d px%s' % (Mf.color_label(spec), area[0], area[1], ', split' if split else '')
 
     def apply_color_to_selected(self):
         selection = self.target_list.curselection()
@@ -481,13 +513,14 @@ class MiquodApp(tk.Tk):
             messagebox.showinfo('MIQUOD', 'Select a target in the list first.')
             return
         try:
-            spec = self._current_color_spec()
-        except (ValueError, tk.TclError):
-            messagebox.showerror('MIQUOD', 'Enter integer values for the custom hue, tolerance, S and V.')
+            spec, area, split = self._current_particle_settings()
+        except ValueError as exc:
+            messagebox.showerror('MIQUOD', str(exc))
             return
-        self.target_colors[selection[0]] = spec
-        self._refresh_targets(selected=selection[0])
-        self.status_var.set('Target %d: particle colour %s.' % (selection[0], Mf.color_label(spec)))
+        j = selection[0]
+        self.target_colors[j], self.target_areas[j], self.target_split[j] = spec, area, split
+        self._refresh_targets(selected=j)
+        self.status_var.set('Target %d: %s.' % (j, self._describe_target(spec, area, split)))
 
     def _on_hover(self, x, y):
         if self.hsv is None:
@@ -504,11 +537,29 @@ class MiquodApp(tk.Tk):
         self.color_var.set('custom')
         self._update_custom_state()
         message = 'Hue %d picked at (%d, %d) (S=%d, V=%d): custom colour set' % (h, x, y, s, v)
+        try:
+            spec = self._current_color_spec()
+            area = Mf.measure_blob_area_at(self.image, x, y, spec)
+        except (ValueError, tk.TclError):
+            area = 0
+        if area > 0:
+            self.area_min_var.set(max(1, area // 4))
+            self.area_max_var.set(area * 4)
+            message += ', particle area about %d px, blob area limits set to %d-%d' % (area, max(1, area // 4),
+                                                                                       area * 4)
+        else:
+            message += ' (the pixel is not inside the colour mask: lower the S or V minimum if needed)'
         selection = self.target_list.curselection()
         if selection:
-            self.target_colors[selection[0]] = self._current_color_spec()
-            self._refresh_targets(selected=selection[0])
-            message += ' and applied to target %d.' % selection[0]
+            try:
+                spec, area_limits, split = self._current_particle_settings()
+            except ValueError as exc:
+                messagebox.showerror('MIQUOD', str(exc))
+                return
+            j = selection[0]
+            self.target_colors[j], self.target_areas[j], self.target_split[j] = spec, area_limits, split
+            self._refresh_targets(selected=j)
+            message += '; applied to target %d.' % j
         else:
             message += '; new targets will use it.'
         self.status_var.set(message)
@@ -519,15 +570,16 @@ class MiquodApp(tk.Tk):
             return
         try:
             Mf.BitMap(self.image).check_rectangle(rect)
-            spec = self._current_color_spec() if color is None else color
+            spec, area, split = self._current_particle_settings()
+            if color is not None:
+                spec = color
         except ValueError as exc:
             messagebox.showerror('MIQUOD', str(exc))
             return
-        except tk.TclError:
-            messagebox.showerror('MIQUOD', 'Enter integer values for the custom hue, tolerance, S and V.')
-            return
         self.targets.append(rect)
         self.target_colors.append(spec)
+        self.target_areas.append(area)
+        self.target_split.append(split)
         self._refresh_targets(selected=len(self.targets) - 1)
         self.status_var.set('%d target(s). Set the parameters and press Process.' % len(self.targets))
 
@@ -553,13 +605,15 @@ class MiquodApp(tk.Tk):
         selection = self.target_list.curselection()
         if not selection:
             return
-        del self.targets[selection[0]]
-        del self.target_colors[selection[0]]
+        for items in (self.targets, self.target_colors, self.target_areas, self.target_split):
+            del items[selection[0]]
         self._refresh_targets()
 
     def clear_targets(self):
         self.targets = []
         self.target_colors = []
+        self.target_areas = []
+        self.target_split = []
         self._refresh_targets()
 
     def _refresh_targets(self, selected=None):
@@ -567,16 +621,18 @@ class MiquodApp(tk.Tk):
             selection = self.target_list.curselection()
             selected = selection[0] if selection else None
         self.target_list.delete(0, 'end')
-        for i, (rect, spec) in enumerate(zip(self.targets, self.target_colors)):
+        for i, rect in enumerate(self.targets):
             self.target_list.insert('end', 'Target %d: X=%d Y=%d W=%d H=%d   %s' % (
-                i, rect.X, rect.Y, rect.Width, rect.Height, Mf.color_label(spec)))
+                i, rect.X, rect.Y, rect.Width, rect.Height,
+                self._describe_target(self.target_colors[i], self.target_areas[i], self.target_split[i])))
         if selected is not None and selected < len(self.targets):
             self.target_list.selection_clear(0, 'end')
             self.target_list.selection_set(selected)
             rect = self.targets[selected]
             for var, value in zip(self.target_vars, rect.as_tuple()):
                 var.set(str(value))
-            self._show_color_in_controls(self.target_colors[selected])
+            self._show_color_in_controls(self.target_colors[selected], self.target_areas[selected],
+                                         self.target_split[selected])
         self.canvas.set_rectangles(self.targets, selected)
 
     # ------------------------------------------------------------------------------------------
@@ -586,11 +642,7 @@ class MiquodApp(tk.Tk):
         threshold = int(self.threshold_var.get())
         if not 0 <= threshold <= 255:
             raise ValueError('The gray threshold must be between 0 and 255.')
-        area_min, area_max = int(self.area_min_var.get()), int(self.area_max_var.get())
-        if area_min < 1 or area_max < area_min:
-            raise ValueError('The blob area limits must satisfy 1 <= min <= max.')
-        return {'mode': self.mode_var.get(), 'threshold': threshold, 'area': [area_min, area_max],
-                'dark': bool(self.dark_var.get())}
+        return {'mode': self.mode_var.get(), 'threshold': threshold, 'dark': bool(self.dark_var.get())}
 
     def process(self):
         if self.image is None:
@@ -611,21 +663,21 @@ class MiquodApp(tk.Tk):
         self.status_var.set('Processing... particle data takes a few seconds, concentration data about half a '
                             'minute on large targets.')
         worker = threading.Thread(target=self._worker,
-                                  args=(self.image, list(self.targets), list(self.target_colors), settings),
+                                  args=(self.image, list(self.targets), list(self.target_colors),
+                                        [list(a) for a in self.target_areas], list(self.target_split), settings),
                                   daemon=True)
         worker.start()
 
-    def _worker(self, image, targets, colors, settings):
-        output = {'settings': settings, 'target_colors': colors}
+    def _worker(self, image, targets, colors, areas, splits, settings):
+        output = {'settings': settings, 'target_colors': colors, 'target_areas': areas, 'target_split': splits}
         try:
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter('always')
                 if settings['mode'] in ('particles', 'both'):
-                    detector = Mf.BlobDetector(**dict(Mf.DEFAULT_DETECTOR_SETTINGS, limit_area=settings['area']))
                     try:
                         output['particles'] = Mf.run_particle_analysis(image, targets, settings['threshold'],
-                                                                       detector=detector, collect_stages=True,
-                                                                       colors=colors)
+                                                                       collect_stages=True, colors=colors,
+                                                                       area_limits=areas, split_touching=splits)
                     except Mf.NotEnoughParticles as exc:
                         # Keep what was detected so the user can see the mask and binary images and retune.
                         output['particle_error'] = str(exc)
@@ -679,14 +731,15 @@ class MiquodApp(tk.Tk):
         results = self.results
         settings = results['settings']
         colors = results.get('target_colors', self.target_colors)
+        areas = results.get('target_areas', self.target_areas)
+        splits = results.get('target_split', self.target_split)
         lines = ['MIQUOD %s' % __version__, 'Image: %s' % self.image_path]
         for j, rect in enumerate(self.targets):
-            lines.append('Target %d: X=%d Y=%d W=%d H=%d (X = column, Y = row), particle colour %s'
-                         % ((j,) + rect.as_tuple() + (Mf.color_label(colors[j]),)))
+            lines.append('Target %d: X=%d Y=%d W=%d H=%d (X = column, Y = row), particles: %s'
+                         % ((j,) + rect.as_tuple() + (self._describe_target(colors[j], areas[j], splits[j]),)))
         lines.append('')
         if 'particles' in results or 'particle_error' in results:
-            lines.append('PARTICLE DATA (threshold %d, blob area %d-%d px)' % (
-                settings['threshold'], settings['area'][0], settings['area'][1]))
+            lines.append('PARTICLE DATA (gray threshold %d)' % settings['threshold'])
         if 'particles' in results:
             lines.append(Mf.summarize_particle_results(results['particles'], ['Image']))
             for j, spacing in enumerate(results['particles']['mean_spacing'][0]):
@@ -823,10 +876,13 @@ class MiquodApp(tk.Tk):
         if not path:
             return
         colors = self.results.get('target_colors', self.target_colors)
+        areas = self.results.get('target_areas', self.target_areas)
+        splits = self.results.get('target_split', self.target_split)
         report = {'miquod_version': __version__, 'image': self.image_path,
                   'image_size': {'columns': int(self.image.shape[1]), 'rows': int(self.image.shape[0])},
-                  'targets': [{'rectangle': t.as_tuple(), 'color': Mf.color_label(c), 'color_spec': c}
-                              for t, c in zip(self.targets, colors)],
+                  'targets': [{'rectangle': t.as_tuple(), 'color': Mf.color_label(c), 'color_spec': c,
+                               'blob_area': list(a), 'split_touching': bool(s)}
+                              for t, c, a, s in zip(self.targets, colors, areas, splits)],
                   'settings': self.results['settings'], 'warnings': self.results.get('warnings', [])}
         base = os.path.splitext(path)[0]
         if 'particles' in self.results:

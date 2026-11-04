@@ -24,7 +24,10 @@ For each target (function `detect_particles_in_target`):
    pixels), and binarised with an inverse threshold at the gray value `T` (`--threshold`): particles
    become black on a white background.
 4. `cv2.SimpleBlobDetector` finds the dark blobs (internal thresholds 150-255, area between 1 and 50 px by
-   default, no circularity, convexity, inertia or colour filter).
+   default, no circularity, convexity, inertia or colour filter). The area limits are set per target.
+   With the *split touching particles* option the blobs are instead the peaks of the distance transform
+   of the particle pixels, one per round particle even when particles touch or overlap, with the same
+   area limits applied to `π r²`.
 5. Each blob centre `(u, v)` (relative to the crop) is stored as the absolute position
    `Point(X + u, Y + v)`.
 

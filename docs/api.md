@@ -28,7 +28,7 @@ in [method.md](method.md).
 | `Transect(TargetArea, Rect, MeanSpacingOfPart)` | Kept for compatibility. |
 | `ListPoints(x, y).list_points(n)` | Kept for compatibility. |
 | `BitMap(img)` | Wraps a numpy image. `Width`, `Height`, `Dimension` (2 for gray, 3 for BGR), `Img`. `clone(rect)` returns the crop (a view) after `check_rectangle(rect)`, which raises `ValueError` when the rectangle is not inside the image. `pixel(x, y, layer)` returns one pixel (`layer` 'R', 'G' or 'B' for BGR images). `BitMap(None)` raises `ValueError`. |
-| `BlobDetector(threshold, flag_area, limit_area, flag_circularity, min_cir, flag_convexity, convexity, flag_inertia, ratio_inertia, flag_color)` | Wrapper of `cv2.SimpleBlobDetector`. `detect_blobs(img)` returns key points; `rectangles(points)` their bounding squares. |
+| `BlobDetector(threshold, flag_area, limit_area, flag_circularity, min_cir, flag_convexity, convexity, flag_inertia, ratio_inertia, flag_color, split_touching=False)` | Wrapper of `cv2.SimpleBlobDetector`. `detect_blobs(img)` returns key points (from `split_touching_particles` when `split_touching` is set); `rectangles(points)` their bounding squares; `settings` holds the constructor arguments. |
 
 Constants: `COLOR_RANGES` (list of HSV `(lower, upper)` bounds per named colour: red 0-10 and 170-179,
 yellow 18-38, green 50-65, blue 85-130, all with saturation and value of at least 100), `COLOR_DRAW` (BGR
@@ -50,15 +50,26 @@ A particle colour is given as a name of `COLOR_RANGES`, a dict `{'hue': h, 'tole
 
 ## High-level functions
 
-### `run_particle_analysis(image_bgr, targets, threshold_value=50, color='red', detector=None, out_dir=None, show=False, verbose=False, horizontal=True, collect_stages=False, colors=None)`
+### `run_particle_analysis(image_bgr, targets, threshold_value=50, color='red', detector=None, out_dir=None, show=False, verbose=False, horizontal=True, collect_stages=False, colors=None, area_limits=None, split_touching=None)`
 
 Full particle pipeline for one image and a list of `Rectangle`. `color` applies to every target; `colors`
-gives one specification per target. Returns the dictionary of `mixing_dim_particle_data` plus
-`particle_positions`, `blob_rectangles`, `mean_spacing`, `transects`, `targets`, `colors` (label per
-target), `color_ranges` and, with `collect_stages`, `detection_stages`. Raises `ValueError` when a target is
-outside the image or the number of colours does not match, and `NotEnoughParticles` (a `ValueError`
-subclass with the attributes `positions`, `rectangles` and `stages` holding what was detected) when a
-target has fewer than four particles.
+gives one specification per target. `area_limits` gives one `(min_area, max_area)` pair per target (a
+detector with those limits and the other settings of `detector` is built for each target) and
+`split_touching` a bool, or one per target, to count touching particles one by one. Returns the
+dictionary of `mixing_dim_particle_data` plus `particle_positions`, `blob_rectangles`, `mean_spacing`,
+`transects`, `targets`, `colors` (label per target), `color_ranges`, `area_limits`, `split_touching` and,
+with `collect_stages`, `detection_stages`. Raises `ValueError` when a target is outside the image or the
+number of colours, limits or flags does not match, and `NotEnoughParticles` (a `ValueError` subclass with
+the attributes `positions`, `rectangles` and `stages` holding what was detected) when a target has fewer
+than four particles.
+
+### Particle size helpers
+
+| Function | Description |
+|---|---|
+| `split_touching_particles(binary, min_area=1, max_area=None)` | Key points of round particles that touch or overlap, from the binary image given to the blob detector (particles black on white): one peak of the distance transform per particle, merged within the radius of the smallest accepted particle; the key point size is the inscribed diameter and particles with estimated area `π r²` outside the limits are dropped. |
+| `detectors_for_area_limits(area_limits, base=None, split_touching=None)` | One `BlobDetector` per `(min, max)` pair with the other settings of `base` (a settings dict). |
+| `measure_blob_area_at(image_bgr, x, y, color, window=400)` | Estimated area (`π r²`, `r` from the distance transform) of the particle of that colour under pixel `(x, y)`, 0 when the pixel is outside the colour mask. Used by the application's right click. |
 
 ### `run_particle_analysis_by_color(image_bgr, targets, colors, threshold_value=50, detector=None, out_dir=None, show=False, verbose=False, horizontal=True, collect_stages=False)`
 

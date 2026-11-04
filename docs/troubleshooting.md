@@ -47,6 +47,15 @@ In the application this is reported as a warning, not an error: the Sequence tab
 failed detection and the concentration results of the same run are kept. In the library the exception is
 `NotEnoughParticles`, which carries the detected positions and the stage images.
 
+**Large particles (beads) are not detected, or several beads count as one**
+The blob area limits (1-50 px by default) are meant for small dye speckles: a bead of 40 px diameter has an
+area of about 1250 px and is rejected, and only its edge fragments are found. Give the target limits
+around the bead area (`--area 100 20000`, or the *Blob area* fields of the target; a right click on a
+bead in the application measures it and fills the limits). Beads that touch each other form one connected
+region, which the blob detector reports as a single large blob: enable *Split touching particles*
+(`--split-touching`) to count them one by one. Pure or dark blue beads can also have a low gray value
+after the colour mask (pure blue converts to gray 29), so lower the gray threshold below it.
+
 **`the maximum striation thickness (N px) is larger than the target (...); no quadrat fits`**
 The particles form one continuous striation across the whole target (every gap between neighbouring
 particles is smaller than the mean spacing), so no quadrat of that size fits. Use a larger target, or a
@@ -71,6 +80,20 @@ The variograms need one pass over the target per lag, up to half the target size
 **The run hangs**
 `--show`, `--select-roi` and `show=True` open windows and wait for them to be closed. Do not use them in
 unattended runs.
+
+## Windows executable
+
+**Windows SmartScreen or the antivirus blocks `MIQUOD.exe`**
+The executable is not code-signed, and self-extracting PyInstaller builds are a common false positive. On
+SmartScreen choose *More info > Run anyway*. On a managed computer, ask the administrator to allow it.
+
+**The window takes several seconds to appear**
+This is normal: every launch unpacks the application to a temporary folder first. It takes about 6 s on the
+development computer, and antivirus scanning can add to that.
+
+**An error appears without details, or a button does nothing**
+The executable has no console, so tracebacks are lost. Run `python miquod_gui.py` from a terminal and repeat
+the steps to see the traceback.
 
 ## Results
 

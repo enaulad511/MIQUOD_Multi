@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 miquod_output/
+build/
+dist/
 .claude/
 CLAUDE.md
 CLAUDE.local.md

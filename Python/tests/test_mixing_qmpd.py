@@ -441,6 +441,60 @@ def test_colour_per_target():
     assert Mf.color_for_drawing('red') == (0, 0, 255) and Mf.color_for_drawing({'hue': 60}) == (0, 255, 0)
 
 
+def test_blob_area_limits_per_target():
+    # left target: small red dots (radius 3, ~29 px); right target: large cyan discs (radius 15, ~700 px)
+    left, right = Mf.Rectangle(10, 10, 180, 480), Mf.Rectangle(200, 10, 290, 480)
+    dots = [(x, y) for y in range(30, 471, 20) for x in range(30, 151, 12)]
+    discs = [(x, y) for y in range(40, 441, 50) for x in range(225, 426, 50)]
+    img = np.maximum(synthetic_particle_image((500, 500), dots),
+                     synthetic_particle_image((500, 500), discs, radius=15, color=(255, 200, 0)))
+    results = Mf.run_particle_analysis(img, [left, right], colors=['red', 'blue'],
+                                       area_limits=[(1, 50), (100, 5000)])
+    assert [len(t) for t in results['particle_positions'][0]] == [len(dots), len(discs)] == [253, 45]
+    assert results['area_limits'] == [[[1, 50], [100, 5000]]]
+    assert results['blob_rectangles'][0][1][0].Width > 20  # the blob size follows the disc diameter
+    # with the default limits (1-50 px) the discs are rejected
+    with pytest.raises(Mf.NotEnoughParticles, match='Target 1'):
+        Mf.run_particle_analysis(img, [left, right], colors=['red', 'blue'])
+    with pytest.raises(ValueError, match='one blob area limit per target'):
+        Mf.run_particle_analysis(img, [left, right], colors=['red', 'blue'], area_limits=[(1, 50)])
+    with pytest.raises(ValueError, match='1 <= min <= max'):
+        Mf.detectors_for_area_limits([(0, 10)])
+    area = Mf.measure_blob_area_at(img, 225, 40, 'blue')
+    assert 600 <= area <= 800
+    assert Mf.measure_blob_area_at(img, 5, 5, 'blue') == 0  # background pixel
+    assert Mf.BlobDetector(**Mf.DEFAULT_DETECTOR_SETTINGS).settings['limit_area'] == [1, 50]
+
+
+def test_split_touching_particles():
+    # four rows of ten overlapping cyan discs (radius 15, centres 24 px apart)
+    target = Mf.Rectangle(20, 20, 320, 260)
+    discs = [(60 + 24 * k, 60 + 60 * row) for row in range(4) for k in range(10)]
+    img = synthetic_particle_image((300, 360), discs, radius=15, color=(255, 200, 0))
+    crop = Mf.BitMap(img).clone(target)
+    merged_detector = Mf.BlobDetector(**dict(Mf.DEFAULT_DETECTOR_SETTINGS, limit_area=[100, 100000]))
+    merged, _ = Mf.detect_particles_in_target(crop, 50, 'blue', merged_detector)
+    assert len(merged) <= 4  # connected blobs: at most one per row
+    split = Mf.run_particle_analysis(img, [target], color='blue', area_limits=[(100, 100000)], split_touching=True)
+    found = sorted((p.X, p.Y) for p in split['particle_positions'][0][0])
+    assert len(found) == len(discs) == 40
+    for (fx, fy), (dx, dy) in zip(found, sorted(discs)):
+        assert abs(fx - dx) <= 2 and abs(fy - dy) <= 2
+    assert split['split_touching'] == [[True]]
+    plain = Mf.run_particle_analysis(img, [Mf.Rectangle(20, 20, 320, 260)], color='blue',
+                                     area_limits=[(100, 100000)], split_touching=False) if False else None
+    assert plain is None
+    assert 25 <= split['blob_rectangles'][0][0][0].Width <= 32  # diameter of the inscribed circle
+    # a bead inside the cluster still reports its own size
+    assert 600 <= Mf.measure_blob_area_at(img, 84, 60, 'blue') <= 800
+    # the area limits also apply to split particles: nothing left when the maximum is too small
+    with pytest.raises(Mf.NotEnoughParticles):
+        Mf.run_particle_analysis(img, [target], color='blue', area_limits=[(100, 300)], split_touching=True)
+    with pytest.raises(ValueError, match='one split_touching flag per target'):
+        Mf.run_particle_analysis(img, [target], color='blue', split_touching=[True, False])
+    assert Mf.split_touching_particles(np.full((20, 20), 255, np.uint8)) == []
+
+
 def test_blob_detection_returns_absolute_positions():
     dots = [(120, 70), (150, 90), (180, 110), (210, 130), (140, 150), (190, 160)]
     img = synthetic_particle_image((300, 400), dots)

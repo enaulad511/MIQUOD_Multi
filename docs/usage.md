@@ -48,6 +48,8 @@ python MIQUOD_v1.py [IMAGE] [--roi X Y WIDTH HEIGHT]... [--select-roi]
 | `--mode` | `particles` (blob detection, striation thickness, PNN), `concentration` (intensity normalisation, variograms, length scales, exposure) or `both`. | `particles` |
 | `--threshold` | Gray threshold applied to the colour-masked image before blob detection. Lower values keep fainter particles. | `50` |
 | `--color COLOUR` | Particle colour of a target: `red`, `green`, `blue`, `yellow`, or `hue:H[:TOL[:SMIN[:VMIN]]]` for a custom hue (OpenCV scale 0-179, tolerance 10 and minimum saturation and value 100 by default). Repeat it once per `--roi`, in the same order, to give each target its own colour; a single `--color` applies to every target. | `red` |
+| `--area MIN MAX` | Blob area limits in pixels of a target. Repeat it once per `--roi` or give it once for all. Small dye speckles are a few pixels; large beads need limits such as `100 20000`. | `1 50` |
+| `--split-touching` | Count touching or overlapping round particles one by one (peaks of the distance transform) instead of one blob per connected region. Use it for large beads in contact. | off |
 | `--dark` | Concentration data: dark pixels carry the higher concentration (`c = 1 - normalised intensity`). | off |
 | `--out-dir DIR` | Output folder, created if needed. | `./miquod_output` |
 | `--no-images` | Do not write the intermediate images. | off |
@@ -62,6 +64,7 @@ python MIQUOD_v1.py sample.png --roi 24 82 2700 2120 --mode both
 python MIQUOD_v1.py sample.png --select-roi --mode concentration --dark
 python MIQUOD_v1.py sample.png --roi 0 0 500 500 --roi 600 0 500 500 --color blue --threshold 60 --show
 python MIQUOD_v1.py sample.png --roi 24 82 900 2120 --color green --roi 1400 82 1300 2120 --color red
+python MIQUOD_v1.py sample.png --roi 700 82 700 2120 --color blue --area 100 20000 --split-touching
 python MIQUOD_v1.py sample.png --roi 0 0 500 500 --color hue:175:8 --quiet --no-images --out-dir results/run1
 ```
 
@@ -90,9 +93,10 @@ Inside `--out-dir`:
 `results.json` keys (lists are indexed `[image][target]`; the command line processes one image, so the
 image index is always 0):
 
-- `targets`: one entry per target with `rectangle` (`[X, Y, Width, Height]`), `color` (label) and
-  `color_spec`.
-- `particles`: `colors` (label per target), `color_ranges` (HSV bounds per target), `particle_positions`
+- `targets`: one entry per target with `rectangle` (`[X, Y, Width, Height]`), `color` (label),
+  `color_spec`, `blob_area` and `split_touching`.
+- `particles`: `colors` (label per target), `color_ranges` (HSV bounds per target), `area_limits`,
+  `split_touching`, `particle_positions`
   (absolute `{X, Y}` = column, row), `blob_rectangles`, `mean_spacing`,
   `transects` (the transect where the maximum striation was found), `max_striation_thickness`,
   `particle_concentration` (quadrat concentrations), `intensity_measures` (`[σ, CoV, M, Cm, Cmax, Cmin, n, N]`),
@@ -120,8 +124,12 @@ The window follows the flow of the Android application:
    R, G, B of the pixel under the mouse in the line below the image; a right click on a particle copies its
    hue into the custom colour and applies it to the selected target (or to the next targets if none is
    selected). To detect two colours in the same region, draw two targets with the same rectangle.
-3. **Parameters**: data type (particles, concentration or both), gray threshold, blob area limits and the
-   *dark areas = higher concentration* option.
+   **Each target also has its own blob area limits and *Split touching particles* option.** The
+   defaults (1-50 px) suit small dye speckles; large beads need limits around their area, and when they
+   touch each other the split option counts them one by one. A right click on a particle also measures
+   its size and sets the limits to a quarter and four times that area.
+3. **Parameters**: data type (particles, concentration or both), gray threshold and the *dark areas =
+   higher concentration* option.
 4. **Process**: runs the analysis in the background; the status line reports progress and errors. When a
    target has fewer than four particles the particle measures are not computed, but the detection images
    are kept in the Sequence and Detection tabs (and the concentration results of the same run are shown)
@@ -141,6 +149,32 @@ Tabs on the right:
   stages (crop, mask, colour, gray, binary, particles) and the concentration stages (filtered crop,
   colour-mapped concentration). Click an image to open it in the Detection tab.
 - **Variograms**: horizontal and vertical variograms of every target (concentration data).
+
+## Windows executable
+
+[Python/miquod_gui.spec](../Python/miquod_gui.spec) packages the desktop application as a single
+`MIQUOD.exe` that runs on a Windows computer without Python. The command-line tool is not included.
+Build it on Windows, with the virtual environment active:
+
+```powershell
+cd Python
+pip install -r requirements-build.txt
+python -m PyInstaller --noconfirm miquod_gui.spec
+```
+
+The result is `Python\dist\MIQUOD.exe` (about 84 MB). `Python\build\` holds intermediate files and can be
+deleted. The executable does not follow changes to the code, so build it again after changing it.
+
+Copy the file anywhere and double-click it. Dropping an image on it opens that image, like
+`python miquod_gui.py image.png`. The sample images are not inside the executable.
+
+The results are the same as running from source: on the sample image, particle and concentration data
+match to full precision. Two things differ:
+
+- Every launch first unpacks the application (about 200 MB) to a temporary folder, which is removed on
+  exit, so the window takes about 6 s to appear instead of about 3 s.
+- There is no console, so the traceback of an unexpected error is not shown. See
+  [troubleshooting.md](troubleshooting.md#windows-executable).
 
 ## Library: `Mixing_QMPD.py`
 
@@ -167,8 +201,10 @@ for j, target in enumerate(targets):
 and `collect_stages=True` to get the intermediate images in `detection_stages`. The particle colour is
 `color` for every target, or `colors=[...]` with one specification per target: a name (`'red'`, `'green'`,
 `'blue'`, `'yellow'`), a dict `{'hue': 60, 'tolerance': 10, 's_min': 100, 'v_min': 100}`, or explicit HSV
-`(lower, upper)` bounds. `run_particle_analysis_by_color(image, targets, ['red', 'green'])` runs the
-whole pipeline once per colour and returns a dictionary keyed by colour, like the Android application.
+`(lower, upper)` bounds. `area_limits=[(1, 50), (100, 20000)]` gives each target its blob area limits and
+`split_touching=True` (or one flag per target) counts touching beads one by one.
+`run_particle_analysis_by_color(image, targets, ['red', 'green'])` runs the whole pipeline once per colour
+and returns a dictionary keyed by colour, like the Android application.
 
 ### Several images, calibration with reference images
 

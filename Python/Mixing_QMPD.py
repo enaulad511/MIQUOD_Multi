@@ -283,6 +283,35 @@ def color_label(color):
     return 'custom'
 
 
+def measure_blob_area_at(image_bgr, x, y, color, window=400):
+    """
+    Estimated area (px) of the particle of the given colour under pixel ``(x, y)``: ``π r²`` with ``r`` the
+    largest inscribed radius (distance transform) of the colour-mask region that contains the pixel, so a
+    bead inside a cluster of touching beads still reports its own size. Returns 0 when the pixel is not
+    inside the colour mask. Only a window of ``±window`` pixels around the point is examined.
+    """
+    h, w = image_bgr.shape[:2]
+    x0, y0 = max(0, int(x) - window), max(0, int(y) - window)
+    x1, y1 = min(w, int(x) + window + 1), min(h, int(y) + window + 1)
+    hsv = cv2.cvtColor(image_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+    mask = color_mask(hsv, color)
+    px, py = int(x) - x0, int(y) - y0
+    if mask[py, px] == 0:
+        return 0
+    n, labels = cv2.connectedComponents(mask, connectivity=8)
+    region = (labels == labels[py, px]).astype(np.uint8)
+    dist = cv2.distanceTransform(region, cv2.DIST_L2, 5)
+    # Radius of the particle under the click: the local maximum of the distance transform closest to it
+    # (a touching cluster has one maximum per bead).
+    local_max = cv2.dilate(dist, np.ones((5, 5), np.uint8))
+    peak_y, peak_x = np.nonzero((dist > 0) & (dist >= local_max - 1e-6))
+    if len(peak_x) == 0:
+        return 0
+    nearest = np.argmin((peak_x - px) ** 2 + (peak_y - py) ** 2)
+    r = float(dist[peak_y[nearest], peak_x[nearest]])
+    return int(round(math.pi * r * r))
+
+
 def color_for_drawing(color):
     """BGR colour used to draw the particles of a colour specification (the hue itself for custom hues)."""
     if isinstance(color, str):
@@ -309,11 +338,14 @@ class BlobDetector:
     :param flag_convexity: filter by convexity (area / convex hull area) within ``convexity``.
     :param flag_inertia: filter by inertia ratio (elongation) within ``ratio_inertia``.
     :param flag_color: filter by colour; ``blobColor`` is 0 (dark blobs).
+    :param split_touching: detect the particles as peaks of the distance transform instead of connected
+                           blobs (``split_touching_particles``), so touching or overlapping round particles
+                           are counted one by one. The area limits still apply (estimated as π r²).
     """
 
     def __init__(self, threshold=None, flag_area=False, limit_area=None, flag_circularity=False, min_cir=0.1,
                  flag_convexity=False, convexity=None, flag_inertia=True, ratio_inertia=None,
-                 flag_color=False):
+                 flag_color=False, split_touching=False):
         if ratio_inertia is None:
             ratio_inertia = [0.0, 0.5]
         if convexity is None:
@@ -322,6 +354,11 @@ class BlobDetector:
             limit_area = [25, 25 * 35]
         if threshold is None:
             threshold = [120, 255]
+        self.settings = dict(threshold=list(threshold), flag_area=flag_area, limit_area=list(limit_area),
+                             flag_circularity=flag_circularity, min_cir=min_cir, flag_convexity=flag_convexity,
+                             convexity=list(convexity), flag_inertia=flag_inertia, ratio_inertia=list(ratio_inertia),
+                             flag_color=flag_color, split_touching=bool(split_touching))
+        self.split_touching = bool(split_touching)
         params = cv2.SimpleBlobDetector_Params()
         # Current OpenCV rejects a minimum of exactly 0 for these ratios, even when the filter is disabled.
         min_ratio = 1e-6
@@ -354,12 +391,53 @@ class BlobDetector:
             self.detector = cv2.SimpleBlobDetector_create(params)
 
     def detect_blobs(self, img):
+        if self.split_touching:
+            if self.settings['flag_area']:
+                low, high = self.settings['limit_area']
+            else:
+                low, high = 1, None
+            return split_touching_particles(img, low, high)
         return self.detector.detect(img)
 
     @staticmethod
     def rectangles(points):
         return [Rectangle(int(item.pt[0] - item.size / 2), int(item.pt[1] - item.size / 2), item.size, item.size)
                 for item in points]
+
+
+def split_touching_particles(binary, min_area=1, max_area=None):
+    """
+    Key points of round particles that may touch or overlap, from a binary image where the particles are
+    black on white (the image given to the blob detector).
+
+    Every particle is a peak of the distance transform of the particle pixels: peaks closer than the radius
+    of the smallest accepted particle (``sqrt(min_area / π)``) are merged, and a peak of distance ``r``
+    gives a key point of diameter ``2 r``. Particles whose estimated area ``π r²`` is outside
+    ``[min_area, max_area]`` are dropped.
+    """
+    foreground = (np.asarray(binary) == 0).astype(np.uint8)
+    if not foreground.any():
+        return []
+    dist = cv2.distanceTransform(foreground, cv2.DIST_L2, 5)
+    r_min = max(1.0, math.sqrt(max(float(min_area), 1.0) / math.pi))
+    radius = max(2, int(round(r_min)))
+    local_max = cv2.dilate(dist, np.ones((2 * radius + 1, 2 * radius + 1), np.uint8))
+    peaks = ((dist >= r_min) & (dist >= local_max - 1e-6)).astype(np.uint8)
+    n, labels, _, centroids = cv2.connectedComponentsWithStats(peaks, connectivity=8)
+    if n <= 1:
+        return []
+    on_peak = peaks > 0
+    r_per_label = np.zeros(n, dtype=np.float64)
+    np.maximum.at(r_per_label, labels[on_peak], dist[on_peak])
+    key_points = []
+    for label in range(1, n):
+        r = float(r_per_label[label])
+        area = math.pi * r * r
+        if area < min_area or (max_area is not None and area > max_area):
+            continue
+        cx, cy = centroids[label]
+        key_points.append(cv2.KeyPoint(float(cx), float(cy), 2.0 * r))
+    return key_points
 
 
 # endregion
@@ -525,7 +603,7 @@ def concentration_stages(image_bgr, rect, concentration):
 
 
 def blob_detection_image(img_to_process, threshold_value, store_target_areas, color='red', detector=None,
-                         show=False, out_dir=None, verbose=True, stages_out=None, colors=None):
+                         show=False, out_dir=None, verbose=True, stages_out=None, colors=None, detectors=None):
     """
     Detect the particles of every target of every image.
 
@@ -535,7 +613,9 @@ def blob_detection_image(img_to_process, threshold_value, store_target_areas, co
     :param color: dye colour of the particles for every target (specification for ``resolve_color``).
     :param colors: optional nested list ``colors[image][target]`` of colour specifications, one per target,
                    which overrides ``color``.
-    :param detector: optional ``BlobDetector`` (default ``DEFAULT_DETECTOR_SETTINGS``).
+    :param detector: optional ``BlobDetector`` for every target (default ``DEFAULT_DETECTOR_SETTINGS``).
+    :param detectors: optional nested list ``detectors[image][target]`` of ``BlobDetector``, one per target
+                      (for example with different blob area limits), which overrides ``detector``.
     :param show: display the intermediate images of each target with matplotlib (blocks).
     :param out_dir: if given, write the intermediate images there as
                     ``img{i}_target{j}_{k}_{stage}.jpg``.
@@ -558,8 +638,9 @@ def blob_detection_image(img_to_process, threshold_value, store_target_areas, co
             stages_out.append([])
         for trg_ind, area in enumerate(store_target_areas[index]):
             spec = color if colors is None else colors[index][trg_ind]
+            det = detector if detectors is None else detectors[index][trg_ind]
             crop = img.clone(area)
-            key_points, stages = detect_particles_in_target(crop, threshold_value, spec, detector)
+            key_points, stages = detect_particles_in_target(crop, threshold_value, spec, det)
             if stages_out is not None:
                 stages_out[index].append(stages)
             positions = [Point(area.X + int(kp.pt[0]), area.Y + int(kp.pt[1])) for kp in key_points]
@@ -1327,16 +1408,42 @@ class NotEnoughParticles(ValueError):
         self.stages = stages
 
 
+def detectors_for_area_limits(area_limits, base=None, split_touching=None):
+    """
+    One ``BlobDetector`` per ``(min_area, max_area)`` pair, with the other settings of ``base`` (a settings
+    dict; default ``DEFAULT_DETECTOR_SETTINGS``). ``split_touching`` is a bool for all or one per pair.
+    """
+    base = dict(DEFAULT_DETECTOR_SETTINGS if base is None else base)
+    if split_touching is None:
+        split_touching = base.get('split_touching', False)
+    if isinstance(split_touching, bool):
+        split_touching = [split_touching] * len(area_limits)
+    detectors = []
+    for limits, split in zip(area_limits, split_touching):
+        low, high = int(limits[0]), int(limits[1])
+        if low < 1 or high < low:
+            raise ValueError('blob area limits must satisfy 1 <= min <= max, got %r' % (list(limits),))
+        detectors.append(BlobDetector(**dict(base, flag_area=True, limit_area=[low, high], split_touching=split)))
+    return detectors
+
+
 def run_particle_analysis(image_bgr, targets, threshold_value=50, color='red', detector=None, out_dir=None,
-                          show=False, verbose=False, horizontal=True, collect_stages=False, colors=None):
+                          show=False, verbose=False, horizontal=True, collect_stages=False, colors=None,
+                          area_limits=None, split_touching=None):
     """
     Full particle-data pipeline for one image and a list of ``Rectangle`` targets.
 
     :param color: colour specification used for every target (see ``resolve_color``).
     :param colors: optional list with one colour specification per target, overriding ``color``.
+    :param detector: ``BlobDetector`` used for every target (default ``DEFAULT_DETECTOR_SETTINGS``).
+    :param area_limits: optional list with one ``(min_area, max_area)`` pair (px) per target; a detector
+                        with those limits (and the other settings of ``detector``) is built for each target.
+    :param split_touching: optional bool, or one bool per target, to count touching or overlapping round
+                           particles one by one (``split_touching_particles``).
     :return: the dictionary of ``mixing_dim_particle_data`` plus ``particle_positions``,
              ``blob_rectangles``, ``mean_spacing``, ``transects``, ``targets``, ``colors`` (label per
-             target) and ``color_ranges``; with ``collect_stages`` also ``detection_stages``.
+             target), ``color_ranges``, ``area_limits`` and ``split_touching``; with ``collect_stages`` also
+             ``detection_stages``.
     """
     img_to_process = [BitMap(image_bgr)]
     store_target_areas = [list(targets)]
@@ -1345,10 +1452,21 @@ def run_particle_analysis(image_bgr, targets, threshold_value=50, color='red', d
     if colors is not None and len(colors) != len(targets):
         raise ValueError('one colour per target is needed: %d targets, %d colours' % (len(targets), len(colors)))
     per_target = list(colors) if colors is not None else [color] * len(targets)
+    if detector is None:
+        detector = BlobDetector(**DEFAULT_DETECTOR_SETTINGS)
+    if split_touching is not None and not isinstance(split_touching, bool) and len(split_touching) != len(targets):
+        raise ValueError('one split_touching flag per target is needed: %d targets, %d flags'
+                         % (len(targets), len(split_touching)))
+    if area_limits is None:
+        area_limits = [detector.settings['limit_area']] * len(targets)
+    elif len(area_limits) != len(targets):
+        raise ValueError('one blob area limit per target is needed: %d targets, %d limits'
+                         % (len(targets), len(area_limits)))
+    detectors = detectors_for_area_limits(area_limits, detector.settings, split_touching)
     stages_out = [] if collect_stages else None
     positions, rectangles = blob_detection_image(img_to_process, threshold_value, store_target_areas, color=color,
                                                  detector=detector, show=show, out_dir=out_dir, verbose=verbose,
-                                                 stages_out=stages_out, colors=[per_target])
+                                                 stages_out=stages_out, colors=[per_target], detectors=[detectors])
     for j, pts in enumerate(positions[0]):
         if len(pts) < 4:
             raise NotEnoughParticles('Target %d (%r): only %d particles detected; at least 4 are needed. Try '
@@ -1363,11 +1481,14 @@ def run_particle_analysis(image_bgr, targets, threshold_value=50, color='red', d
         results['detection_stages'] = stages_out
     results['colors'] = [[color_label(spec) for spec in per_target]]
     results['color_ranges'] = [[resolve_color(spec) for spec in per_target]]
+    results['area_limits'] = [[list(det.settings['limit_area']) for det in detectors]]
+    results['split_touching'] = [[det.split_touching for det in detectors]]
     return results
 
 
 def run_particle_analysis_by_color(image_bgr, targets, colors, threshold_value=50, detector=None, out_dir=None,
-                                   show=False, verbose=False, horizontal=True, collect_stages=False):
+                                   show=False, verbose=False, horizontal=True, collect_stages=False,
+                                   area_limits=None):
     """
     ``run_particle_analysis`` once per dye colour, as the Android application does.
 
@@ -1387,7 +1508,7 @@ def run_particle_analysis_by_color(image_bgr, targets, colors, threshold_value=5
             print('Particle colour: %s' % label)
         try:
             results[label] = run_particle_analysis(image_bgr, targets, threshold_value, spec, detector, label_dir,
-                                                   show, verbose, horizontal, collect_stages)
+                                                   show, verbose, horizontal, collect_stages, area_limits=area_limits)
         except NotEnoughParticles as exc:
             if verbose:
                 print('  not computed: %s' % exc)

@@ -73,6 +73,15 @@ Red sits at both ends of the hue circle. The 2.0 mask kept hue 0-10 only; the 2.
 this adds 211 particles. The 2.0 range is still available as an explicit specification
 (`(np.array([0, 100, 100]), np.array([10, 255, 255]))`), and the slow test checks both.
 
+### Blob size per target and touching particles
+
+The blob area limits are set per target (`area_limits=` in `run_particle_analysis`, one `--area` per
+`--roi`, the *Blob area* fields of the target in the application), because small dye speckles and large
+beads need different limits. The *split touching particles* option (`split_touching`, `--split-touching`)
+replaces the connected-blob detection by the peaks of the distance transform, so large beads in contact
+are counted one by one. `measure_blob_area_at` estimates the size of a particle under a pixel (the
+application's right click).
+
 ### Colour per target
 
 Each target can have its own particle colour (`colors=` in `run_particle_analysis`, one `--color` per
@@ -130,7 +139,8 @@ numbers. They can be revisited later.
   of the 2.0 script are ignored.
 - New: `detect_particles_in_target`, `annotate_particles`, `draw_particles`, `show_detection_stages`,
   `montage_images`, `concentration_to_image`, `concentration_stages`, `hsv_ranges_from_hue`,
-  `resolve_color`, `color_mask`, `color_label`, `color_for_drawing`, `run_particle_analysis`,
+  `resolve_color`, `color_mask`, `color_label`, `color_for_drawing`, `split_touching_particles`,
+  `detectors_for_area_limits`, `measure_blob_area_at`, `BlobDetector.settings`, `run_particle_analysis`,
   `run_particle_analysis_by_color`, `run_concentration_analysis`, `summarize_particle_results`,
   `summarize_concentration_results`, `to_jsonable`, `NotEnoughParticles`, `COLOR_RANGES` (lists of ranges),
   `COLOR_DRAW`, `DEFAULT_DETECTOR_SETTINGS`, `Rectangle.right/bottom/area/contains/as_tuple`,

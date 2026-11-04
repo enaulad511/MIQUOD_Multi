@@ -68,6 +68,11 @@ def parse_args(argv=None):
                         help='particle colour: %s, or hue:H[:TOL[:SMIN[:VMIN]]] for a custom hue (OpenCV scale '
                              '0-179, default tolerance 10, S and V at least 100). Give it once for every '
                              'target or once for all (default: red)' % ', '.join(sorted(Mf.COLOR_RANGES)))
+    parser.add_argument('--area', action='append', nargs=2, type=int, metavar=('MIN', 'MAX'),
+                        help='blob area limits in pixels of a target (default 1 50). Give it once per target or '
+                             'once for all')
+    parser.add_argument('--split-touching', action='store_true',
+                        help='count touching or overlapping round particles one by one (large beads in contact)')
     parser.add_argument('--dark', action='store_true',
                         help='concentration data: dark areas carry the higher concentration')
     parser.add_argument('--out-dir', default='miquod_output', metavar='DIR',
@@ -108,6 +113,20 @@ def resolve_colors(args, targets):
         raise ValueError('give one --color per target or a single --color for all (%d targets, %d colours)'
                          % (len(targets), len(colors)))
     return colors
+
+
+def resolve_areas(args, targets):
+    """One [min, max] blob area per target: a single --area applies to all targets."""
+    areas = [list(a) for a in (args.area or [Mf.DEFAULT_DETECTOR_SETTINGS['limit_area']])]
+    for low, high in areas:
+        if low < 1 or high < low:
+            raise ValueError('--area limits must satisfy 1 <= MIN <= MAX, got %d %d' % (low, high))
+    if len(areas) == 1:
+        return areas * len(targets)
+    if len(areas) != len(targets):
+        raise ValueError('give one --area per target or a single --area for all (%d targets, %d limits)'
+                         % (len(targets), len(areas)))
+    return areas
 
 
 def select_rois_interactively(image):
@@ -154,6 +173,7 @@ def main(argv=None):
     try:
         targets = resolve_targets(args, image)
         colors = resolve_colors(args, targets)
+        areas = resolve_areas(args, targets)
     except ValueError as exc:
         sys.exit('Error: %s' % exc)
     out_dir = os.path.abspath(args.out_dir)
@@ -163,23 +183,28 @@ def main(argv=None):
         print('MIQUOD %s' % __version__)
         print('Image: %s (%d columns x %d rows)' % (args.image, image.shape[1], image.shape[0]))
         for j, rect in enumerate(targets):
-            print('Target %d: %r, particle colour %s' % (j, rect, Mf.color_label(colors[j])))
+            print('Target %d: %r, particle colour %s, blob area %d-%d px%s' % (
+                j, rect, Mf.color_label(colors[j]), areas[j][0], areas[j][1],
+                ', split touching' if args.split_touching else ''))
 
     report = {'miquod_version': __version__, 'image': os.path.abspath(args.image),
               'image_size': {'columns': int(image.shape[1]), 'rows': int(image.shape[0])},
-              'targets': [{'rectangle': t.as_tuple(), 'color': Mf.color_label(c), 'color_spec': c}
-                          for t, c in zip(targets, colors)],
+              'targets': [{'rectangle': t.as_tuple(), 'color': Mf.color_label(c), 'color_spec': c, 'blob_area': a,
+                           'split_touching': bool(args.split_touching)}
+                          for t, c, a in zip(targets, colors, areas)],
               'mode': args.mode}
     started = time.time()
     try:
         if args.mode in ('particles', 'both'):
             report['particle_settings'] = {'threshold': args.threshold,
                                            'colors': [Mf.color_label(c) for c in colors],
+                                           'blob_area': areas, 'split_touching': bool(args.split_touching),
                                            'detector': Mf.DEFAULT_DETECTOR_SETTINGS}
             if verbose:
                 print('\nParticle data (threshold %d)' % args.threshold)
             particles = Mf.run_particle_analysis(image, targets, args.threshold, out_dir=image_dir, show=args.show,
-                                                 verbose=verbose, colors=colors)
+                                                 verbose=verbose, colors=colors, area_limits=areas,
+                                                 split_touching=bool(args.split_touching))
             report['particles'] = particles
             if image_dir:
                 annotated = image
